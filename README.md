@@ -200,12 +200,6 @@ Use the sidebar sliders to:
 
 ---
 
-## 📝 CV line
-
-> *"Built LSTM-based predictive maintenance model on NASA CMAPSS turbofan dataset, achieving +23 cycle earlier fault detection vs EKF baseline (F1: 89.6% vs 71.4%) — deployed as interactive Streamlit dashboard with real-time anomaly scoring and RUL prediction."*
-
----
-
 ## 📄 License
 
 MIT — free to use, modify, and build on.
