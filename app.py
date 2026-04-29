@@ -445,20 +445,28 @@ def main():
     # ── Single engine stream (Tabs 1 / 2 / 3) ────────────────────────────
     X        = generate_demo_engine(cfg["n_cycles"], cfg["fault_at"])
     lstm_raw = _recon_error(X)
-    ekf_raw  = _ekf_score(X)[len(X) - len(lstm_raw):]
+    ekf_raw  = _ekf_score(X)[30:30+len(lstm_raw)]  # align to LSTM window offset
 
-    # EMA smoothing (α = 0.25)
-    lstm_ema = np.zeros_like(lstm_raw)
-    lstm_ema[0] = lstm_raw[0]
+    # EMA smooth LSTM (α = 0.25) before normalisation
+    lstm_ema_raw = np.zeros_like(lstm_raw)
+    lstm_ema_raw[0] = lstm_raw[0]
     for i in range(1, len(lstm_raw)):
-        lstm_ema[i] = 0.25 * lstm_raw[i] + 0.75 * lstm_ema[i-1]
+        lstm_ema_raw[i] = 0.25 * lstm_raw[i] + 0.75 * lstm_ema_raw[i-1]
+
+    # Normalise BOTH curves to [0, 1] for display on the live chart.
+    # This makes the sidebar threshold slider (0.1–0.9) meaningful for both.
+    # Fleet evaluation uses raw scores with separately calibrated thresholds.
+    _lstm_min, _lstm_max = lstm_ema_raw.min(), lstm_ema_raw.max()
+    _ekf_min,  _ekf_max  = ekf_raw.min(),      ekf_raw.max()
+    lstm_ema    = (lstm_ema_raw - _lstm_min) / (_lstm_max - _lstm_min + 1e-8)
+    ekf_display = (ekf_raw      - _ekf_min)  / (_ekf_max  - _ekf_min  + 1e-8)
 
     cycles = np.arange(len(lstm_ema))
 
     # RUL arrays
     rul_true = np.minimum(125,
                np.maximum(0, (cfg["n_cycles"] - 30 - cycles).astype(float)))
-    rul_pred = np.clip(rul_true + np.random.default_rng(7).normal(0, 8, len(rul_true)),
+    rul_pred = np.clip(rul_true + np.random.default_rng(cfg['fault_at']).normal(0, 4, len(rul_true)),
                        0, 125)
 
     # Per-sensor errors
@@ -588,7 +596,7 @@ def main():
     # ── TAB 1: Live Monitor ───────────────────────────────────────────────
     with tab1:
         st.plotly_chart(
-            chart_anomaly(cycles[:cur], lstm_ema[:cur], ekf_raw[:cur], thr,
+            chart_anomaly(cycles[:cur], lstm_ema[:cur], ekf_display[:cur], thr,
                           alarm_idx if alarm_idx and alarm_idx < cur else None, cur),
             use_container_width=True,
         )
