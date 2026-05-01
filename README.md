@@ -277,16 +277,7 @@ hardcoded values.
 | Phase 2 loss | MSE + 0.3 × asymmetric NASA RUL loss (all windows) |
 | Threshold | μ + 2.5σ of healthy training reconstruction errors |
 
----
 
-## 📝 CV line
-
-> *"Built LSTM-based predictive maintenance system on NASA CMAPSS turbofan
-> dataset. Bidirectional LSTM autoencoder achieves F1=93.9% vs EKF baseline
-> F1=49.1% (+44.8pp), detecting faults 19 cycles before the classical filter
-> by learning joint multivariate drift patterns across 14 sensors. Deployed as
-> interactive Streamlit dashboard with real-time anomaly scoring, RUL prediction,
-> and live metric computation via a custom evaluation pipeline."*
 
 ---
 
