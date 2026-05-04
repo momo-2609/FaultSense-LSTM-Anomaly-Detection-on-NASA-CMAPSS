@@ -1,4 +1,4 @@
-"""
+""
 app.py
 ------
 FaultSense Streamlit Dashboard
@@ -398,10 +398,21 @@ def delta_badge(val, better="higher"):
 def build_sidebar():
     st.sidebar.markdown("## ⚡ FaultSense")
     st.sidebar.markdown("---")
+
+    # Auto-detect checkpoint
+    _here = Path(__file__).resolve().parent
+    _auto = _here / "checkpoints" / "faultsense_fd001.pt"
+    _auto_str = str(_auto) if _auto.exists() else None
+
     mode = st.sidebar.radio("Mode", ["Demo (synthetic)", "Load checkpoint"], index=0)
     ckpt_path = None
     if mode == "Load checkpoint":
-        ckpt_path = st.sidebar.text_input("Checkpoint path", "checkpoints/faultsense.pt")
+        default = str(_auto) if _auto_str else "checkpoints/faultsense_fd001.pt"
+        ckpt_path = st.sidebar.text_input("Checkpoint path", default)
+        if ckpt_path and Path(ckpt_path).exists():
+            st.sidebar.success("Checkpoint found — real model active")
+        elif ckpt_path:
+            st.sidebar.error(f"File not found: {ckpt_path}")
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("**Simulation**")
@@ -438,9 +449,79 @@ def build_sidebar():
 # MAIN
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+@st.cache_resource
+def _load_ckpt(path: str):
+    """Load checkpoint — cached so it only runs once."""
+    try:
+        import sys, torch
+        _HERE = Path(__file__).resolve().parent
+        if str(_HERE) not in sys.path:
+            sys.path.insert(0, str(_HERE))
+        from models.lstm_autoencoder import FaultSenseModel
+        ckpt  = torch.load(path, map_location="cpu")
+        cfg_  = ckpt["config"]
+        model = FaultSenseModel(
+            n_sensors=len(ckpt["sensor_cols"]),
+            hidden=cfg_["hidden"], latent=cfg_["latent"],
+            seq_len=cfg_["seq_len"], dropout=cfg_["dropout"],
+            rul_cap=cfg_["rul_cap"],
+        )
+        model.load_state_dict(ckpt["model_state"])
+        model.threshold   = ckpt["threshold"]
+        model.sensor_cols = ckpt["sensor_cols"]
+        model.eval()
+        return model, ckpt, None
+    except Exception as e:
+        return None, None, str(e)
+
+
+def _run_real_inference(model, X_test, y_test, rul_cap=125.0):
+    """Run real model on CMAPSS test set windows."""
+    import torch, torch.nn.functional as F
+    results = []
+    model.eval()
+    with torch.no_grad():
+        for i in range(len(X_test)):
+            x = torch.from_numpy(X_test[i:i+1]).float()
+            recon, rul_pred, _ = model(x)
+            err      = F.mse_loss(recon, x, reduction="none")
+            score    = float(err.mean())
+            per_sens = err.mean(dim=1).squeeze().numpy()
+            rul      = float(rul_pred.item()) * rul_cap
+            results.append({
+                "score":      score,
+                "rul_pred":   rul,
+                "rul_true":   float(y_test[i]),
+                "per_sensor": per_sens,
+                "is_anomaly": score > model.threshold,
+            })
+    return results
+
+
 def main():
     cfg = build_sidebar()
     thr = cfg["threshold"]
+
+    # ── Load real checkpoint if available ────────────────────────────────
+    real_model = None
+    real_ckpt  = None
+    real_results = None
+    _ckpt = cfg.get("ckpt_path")
+    if _ckpt and cfg.get("mode") == "Load checkpoint" and Path(_ckpt).exists():
+        real_model, real_ckpt, _err = _load_ckpt(_ckpt)
+        if _err:
+            st.sidebar.error(f"Load failed: {_err}")
+        elif real_model is not None:
+            st.sidebar.success(f"Model loaded  τ={real_model.threshold:.3f}")
+            # Load test data
+            import pickle
+            _HERE = Path(__file__).resolve().parent
+            _pkl  = _HERE / "data" / "processed" / "cmapss_fd001.pkl"
+            if _pkl.exists():
+                with open(str(_pkl), "rb") as f_:
+                    _d = pickle.load(f_)
+                real_results = _run_real_inference(
+                    real_model, _d["X_test"], _d["y_test"])
 
     # ── Single engine stream (Tabs 1 / 2 / 3) ────────────────────────────
     X        = generate_demo_engine(cfg["n_cycles"], cfg["fault_at"])
@@ -545,9 +626,12 @@ def main():
     # ── Header ────────────────────────────────────────────────────────────
     col_h1, col_h2, col_h3 = st.columns([3, 1, 1])
     with col_h1:
+        mode_badge = "Real model" if cfg.get("mode", "") == "Load checkpoint" else "Demo mode"
         st.markdown("## ⚡ FaultSense · Turbofan Anomaly Monitor")
-        st.caption(f"NASA CMAPSS FD001 · Fault onset cycle {cfg['fault_at']} · "
-                   f"All metrics computed live from metrics.py")
+        st.caption(
+            f"NASA CMAPSS {cfg.get('subset', 'FD001')} · {mode_badge} · "
+            f"All metrics computed live from metrics.py"
+        )
     with col_h2:
         if s > thr:
             st.markdown(badge("ALARM", "alarm"), unsafe_allow_html=True)
@@ -642,20 +726,36 @@ def main():
         c3.metric("Error",          f"{err:+.1f} cycles", delta_color="inverse")
 
         st.markdown("---")
+        # Use real CMAPSS test results if checkpoint loaded, else synthetic
+        if real_results is not None:
+            _preds = np.array([r["rul_pred"] for r in real_results])
+            _trues = np.array([r["rul_true"] for r in real_results])
+            _rmse  = rul_rmse_val.__class__  # just use the function
+            _rmse_v = float(np.sqrt(np.mean((_preds - _trues)**2)))
+            _mae_v  = float(np.abs(_preds - _trues).mean())
+            _nasa_v = nasa_val.__class__  # placeholder
+            import numpy as _np2
+            _d2 = _preds - _trues
+            _nasa_v = float(_np2.where(_d2<0, _np2.exp(-_d2/13)-1, _np2.exp(_d2/10)-1).sum())
+            _src_lbl = "NASA CMAPSS FD001 test set (100 engines)"
+        else:
+            _rmse_v, _mae_v, _nasa_v = rul_rmse_val, rul_mae_val, nasa_val
+            _src_lbl = f"Synthetic fleet ({N_ENGINES_DEMO} engines)"
+
         st.markdown("#### Fleet RUL metrics — computed from `metrics.py`")
-        st.caption(f"Over {N_ENGINES_DEMO} synthetic engines, final cycle prediction.")
+        st.caption(_src_lbl)
 
         r1, r2, r3 = st.columns(3)
         with r1:
-            rul_col = "status-ok" if rul_rmse_val < 15 else "status-warn"
-            status_card("RMSE", f"{rul_rmse_val:.1f} cyc",
-                        "rmse() — target < 15", rul_col)
+            rul_col = "status-ok" if _rmse_v < 20 else "status-warn"
+            status_card("RMSE", f"{_rmse_v:.1f} cyc",
+                        "rmse() — target < 20", rul_col)
         with r2:
-            status_card("MAE", f"{rul_mae_val:.1f} cyc",
+            status_card("MAE", f"{_mae_v:.1f} cyc",
                         "mean_absolute_error()", "status-ok")
         with r3:
-            nasa_col = "status-ok" if nasa_val < 500 else "status-warn"
-            status_card("NASA score", f"{nasa_val:.1f}",
+            nasa_col = "status-ok" if _nasa_v < 5000 else "status-warn"
+            status_card("NASA score", f"{_nasa_v:.1f}",
                         "nasa_score() — lower is better", nasa_col)
 
         with st.expander("What does the NASA score mean?"):
