@@ -150,7 +150,7 @@ class RULHead(nn.Module):
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """z : (B, latent) → rul_pred : (B,)"""
         rul = self.mlp(z).squeeze(-1)
-        return torch.clamp(rul, 0, self.rul_cap)
+        return torch.clamp(rul, 0.0, 1.0)  # normalised — multiply by rul_cap at inference
 
 
 class FaultSenseModel(nn.Module):
@@ -218,10 +218,12 @@ class FaultSenseModel(nn.Module):
         per_sens = raw_err.mean(dim=1).cpu().numpy()   # (B, n_sensors)
         rul      = rul_pred.cpu().numpy()
 
+        # Denormalise RUL from [0,1] training space → cycles
+        rul_cycles = rul * self.rul_head.rul_cap
         result = {
-            "anomaly_score":  score[0] if single else score,
-            "rul":            rul[0]   if single else rul,
-            "per_sensor_mse": per_sens[0] if single else per_sens,
+            "anomaly_score":  score[0]      if single else score,
+            "rul":            rul_cycles[0] if single else rul_cycles,
+            "per_sensor_mse": per_sens[0]   if single else per_sens,
             "is_anomaly": (score[0] > self.threshold) if (
                 single and self.threshold is not None) else None,
         }
