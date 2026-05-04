@@ -158,7 +158,8 @@ def binary_labels_persistent(scores: np.ndarray,
 
 def detection_lead_time(scores: np.ndarray,
                          threshold: float,
-                         true_fault_cycle: int) -> Optional[int]:
+                         true_fault_cycle: int,
+                         max_lead: Optional[int] = None) -> Optional[int]:
     """
     Cycles of early warning: how many cycles before the true fault
     onset does the detector first alarm?
@@ -175,11 +176,32 @@ def detection_lead_time(scores: np.ndarray,
     scores           : (T,) anomaly score sequence for one engine
     threshold        : decision boundary
     true_fault_cycle : ground-truth cycle index where fault begins
+    max_lead         : if set, alarms more than max_lead cycles before
+                       the fault are treated as false positives and
+                       ignored. Only the first alarm within the valid
+                       detection window [fault_cycle-max_lead, end]
+                       is counted. Use max_lead=fault_window to match
+                       evaluate_detector's positive zone definition.
+
+    Notes
+    -----
+    Without max_lead, a noisy detector that fires randomly in the
+    healthy zone (e.g. EKF with high sensitivity) will appear to have
+    a very large lead time — but those are false positives, not early
+    detections. Setting max_lead=fault_window gives a fair comparison.
     """
-    alarm = next(
-        (t for t, s in enumerate(scores) if s > threshold),
-        None
-    )
+    if max_lead is not None:
+        # only consider alarms within the valid detection window
+        start = max(0, true_fault_cycle - max_lead)
+        alarm = next(
+            (t for t, s in enumerate(scores) if t >= start and s > threshold),
+            None
+        )
+    else:
+        alarm = next(
+            (t for t, s in enumerate(scores) if s > threshold),
+            None
+        )
     if alarm is None:
         return None
     return true_fault_cycle - alarm
@@ -359,7 +381,8 @@ def evaluate_detector(
             precisions.append(prf["precision"])
             recalls.append(prf["recall"])
             f1s.append(prf["f1"])
-            lt = detection_lead_time(scores, threshold, fc)
+            lt = detection_lead_time(scores, threshold, fc,
+                                      max_lead=fault_window)
             if lt is not None:
                 lead_times.append(lt)
         return {
@@ -385,7 +408,10 @@ def evaluate_detector(
         all_pred.extend(y_pred.tolist())
         all_true.extend(y_true.tolist())
 
-        lt = detection_lead_time(scores, threshold, fc)
+        # pass fault_window as max_lead so random healthy-zone alarms
+        # (false positives) are not counted as valid early detections
+        lt = detection_lead_time(scores, threshold, fc,
+                                  max_lead=fault_window)
         if lt is not None:
             lead_times.append(lt)
 
