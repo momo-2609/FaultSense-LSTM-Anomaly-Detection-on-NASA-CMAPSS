@@ -1,262 +1,230 @@
-# ⚡ FaultSense — LSTM Anomaly Detection on NASA CMAPSS
+# FaultSense
 
-> Bidirectional LSTM Autoencoder for turbofan engine fault detection and Remaining Useful Life prediction — trained on real NASA CMAPSS data with a live Streamlit dashboard where all metrics are computed in real time from `metrics.py`.
-
-![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat&logo=python&logoColor=white)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C?style=flat&logo=pytorch&logoColor=white)
-![Streamlit](https://img.shields.io/badge/Streamlit-1.28+-FF4B4B?style=flat&logo=streamlit&logoColor=white)
-![Dataset](https://img.shields.io/badge/Dataset-NASA%20CMAPSS%20FD001-blue?style=flat)
-![License](https://img.shields.io/badge/License-MIT-green?style=flat)
+**End-to-end predictive maintenance system** — LSTM Autoencoder anomaly detection and Remaining Useful Life (RUL) prediction on NASA CMAPSS turbofan engine data, with an Extended Kalman Filter baseline, REST API, MLflow experiment tracking, and a Streamlit dashboard.
 
 ---
 
-## 🎯 Results — NASA CMAPSS FD001 (100 test engines)
+## Results
 
-All metrics computed by `utils/metrics.py` on real CMAPSS data.
-Each detector uses its own calibrated threshold τ = μ + 2.5σ.
+| Subset | Conditions | Fault modes | Test RMSE (cycles) | NASA Score |
+|--------|-----------|-------------|-------------------|------------|
+| FD001  | 1         | 1           | ~50               | ~15 000    |
+| FD002  | 6         | 1           | —                 | —          |
+| FD003  | 1         | 2           | —                 | —          |
+| FD004  | 6         | 2           | —                 | —          |
 
-### RUL Prediction (test set — 100 unseen engines)
-
-| Metric | Value | Notes |
-|--------|-------|-------|
-| **Test RMSE** | **43.3 cycles** | Val RMSE = 13 cycles (seen engines) |
-| **Test MAE** | ~35 cycles | |
-| **NASA score** | **7,982** | Down from 340,000 before cycle_norm fix |
-| Val RMSE | **13 cycles** | Competitive with published results |
-
-> The val/test RMSE gap (13 vs 43 cycles) is a known CMAPSS challenge: the
-> test set gives only the last 30-cycle window of 100 unseen engines at unknown
-> degradation stages. The model systematically underestimates high-RUL engines
-> that haven't yet shown measurable degradation — a fundamental limitation of
-> single-window RUL prediction without trajectory context.
-
-### Anomaly Detection (synthetic fleet, 20 engines)
-
-| Metric | LSTM | EKF Baseline | Δ |
-|--------|:----:|:------------:|:---:|
-| F1 Score | **93.9%** | 49.1% | **+44.8 pp** |
-| Precision | **99.3%** | 94.2% | +5.1 pp |
-| Recall | **89.2%** | 33.2% | **+56.0 pp** |
-| Mean lead time | **19 cycles** | 16 cycles | +3 cycles |
-| Early detect rate (≥10 cyc) | **100%** | 90% | +10 pp |
-| False alarm rate | **0.66/100 cyc** | 2.02/100 cyc | −1.36 |
+> Lower is better for both metrics. FD001 trained; FD002–FD004 in progress.
 
 ---
 
-## 🧠 What is this?
-
-Industrial turbofan engines degrade over hundreds of operating cycles. The
-problem: **there are no fault labels during normal operation** — you only know
-an engine failed after it did.
-
-FaultSense solves this with an **unsupervised** approach:
-
-1. Train a bidirectional LSTM autoencoder **only on healthy sensor data**
-2. The model learns to compress and reconstruct normal operation patterns
-3. When a degraded engine arrives, reconstruction quality drops — that drop **is** the anomaly score
-4. A separate RUL regression head predicts remaining useful life in cycles
-
-The key insight over classical methods (EKF) is that the LSTM sees a **30-cycle
-window** and measures **joint multivariate drift** across 14 sensors + a
-normalised cycle position feature — detecting coordinated sensor drift long
-before any single sensor crosses an absolute threshold.
+## Architecture
 
 ```
-Input (30 cycles × 15 features: 14 sensors + cycle_norm)
-        ↓
-  BiLSTM encoder (128 units, bidirectional)
-        ↓
-  Bottleneck (32-dim latent z)       ← anomaly lives here
-        ↓
-  LSTM decoder → reconstructed sequence
-        ↓
-  anomaly score = MSE(input, reconstruction)
-        ↓
-  RUL head: MLP on z → normalised RUL → × 125 cycles
+Raw sensor data (21 sensors × N cycles)
+        │
+        ▼
+  preprocess.py
+  ├── Drop zero-variance sensors  (14 → 15 features incl. cycle_norm)
+  ├── K-means operating condition clustering  (FD002/FD004 only)
+  ├── Per-engine × condition Z-score normalisation
+  └── Sliding window extraction  (seq_len=30)
+        │
+        ▼
+  FaultSenseModel  (models/lstm_autoencoder.py)
+  ├── Encoder:  BiLSTM(128) → Dropout → LSTM(64) → Dense(32, tanh)
+  ├── Decoder:  RepeatVector → LSTM(64) → LSTM(128) → Dense(n_sensors)
+  └── RUL head: MLP(32 → 16 → 1) attached to latent z
+        │
+  Two-phase training (train.py)
+  ├── Phase 1: AE pre-training on healthy-only windows
+  └── Phase 2: Joint AE + RUL fine-tuning with asymmetric NASA loss
+        │
+        ▼
+  Inference
+  ├── Anomaly score  =  MSE(input, reconstruction)
+  ├── Alarm          =  score > μ + 2.5σ  (calibrated on healthy data)
+  └── RUL prediction =  MLP(z) × 125 cycles
+
+  EKFBaseline  (models/ekf_baseline.py)
+  └── Per-sensor Kalman filter, Mahalanobis innovation score, EMA smoothing
 ```
 
 ---
 
-## 📊 Dataset — NASA CMAPSS FD001
+## Quickstart
 
-| Property | Value |
-|----------|-------|
-| Source | [NASA Prognostics Data Repository](https://ti.arc.nasa.gov/tech/dash/groups/pcoe/prognostic-data-repository/) |
-| Engines (train) | 100 units, run to failure |
-| Engines (test) | 100 units, truncated at unknown RUL |
-| Sensors | 21 raw → 14 after dropping 7 near-zero-variance sensors |
-| Features | 15 total (14 sensors + cycle_norm position feature) |
-| Avg engine life | ~206 cycles |
-| Window size | 30 cycles |
-| RUL cap | 125 cycles (piecewise linear) |
-
----
-
-## 🗂️ Project structure
-
-```
-NASA/
-├── app.py              # Streamlit dashboard — all metrics live from metrics.py
-├── train.py            # Two-phase training loop (Phase 1: AE, Phase 2: AE+RUL)
-├── preprocess.py       # CMAPSS loading, normalisation, windowing (all 4 subsets)
-├── metrics.py          # RMSE, NASA score, P/R/F1, lead time, EDR, FAR
-├── models/
-│   ├── __init__.py
-│   ├── lstm_autoencoder.py   # BiLSTM AE + RUL head (PyTorch)
-│   └── ekf_baseline.py       # Per-sensor Kalman filter baseline
-└── data/
-    ├── raw/            # ← place CMAPSS files here
-    │   ├── train_FD001.txt
-    │   ├── test_FD001.txt
-    │   └── RUL_FD001.txt
-    └── processed/      # ← generated by preprocess.py
-        └── cmapss_fd001.pkl
-```
-
----
-
-## 🚀 Quickstart
-
-### 1. Install dependencies
+### 1. Install
 
 ```bash
-pip install torch numpy pandas scikit-learn streamlit plotly
+git clone https://github.com/momo-2609/faultsense
+cd faultsense
+pip install -r requirements.txt
 ```
 
-### 2. Download the dataset
+### 2. Download data
 
+Download the **Turbofan Engine Degradation Simulation Data Set** from the
 [NASA Prognostics Data Repository](https://ti.arc.nasa.gov/tech/dash/groups/pcoe/prognostic-data-repository/)
-→ Turbofan Engine Degradation Simulation Data Set
-→ Place `train_FD001.txt`, `test_FD001.txt`, `RUL_FD001.txt` in `data/raw/`
+and place the `.txt` files in `data/raw/`:
+
+```
+data/raw/
+├── train_FD001.txt
+├── test_FD001.txt
+├── RUL_FD001.txt
+└── ... (FD002, FD003, FD004)
+```
 
 ### 3. Preprocess
 
 ```bash
-python preprocess.py --subset FD001
-# → data/processed/cmapss_fd001.pkl  (X_train: 14379×30×15)
+python preprocess.py --subset FD001        # single subset
+python preprocess.py                        # all 4 subsets
 ```
 
-### 4. Train (~25 min on CPU)
+### 4. Train
 
 ```bash
-python train.py --subset FD001
-# Phase 1: AE pre-training on healthy-only windows (50 epochs max)
-# Phase 2: Joint AE + RUL fine-tuning (100 epochs max)
-# → checkpoints/faultsense_fd001.pt
+python train.py --subset FD001             # train FD001
+python train.py --all                      # train all 4 subsets
 ```
 
-### 5. Launch dashboard
+Training logs to MLflow automatically if the server is running (see below).
+
+### 5. Launch the dashboard
 
 ```bash
 streamlit run app.py
-# Opens http://localhost:8501
-# Select "Load checkpoint" in sidebar → enter checkpoint path
 ```
 
 ---
 
-## 🔬 How it works
+## REST API + MLflow
 
-### Two-phase training
+Start the full stack (API on `:8000`, MLflow on `:5000`) with Docker:
 
-**Phase 1 — Autoencoder pre-training (healthy only)**
-Train only on windows where RUL = 125 (healthy cap zone). The model learns a
-tight manifold of normal operation. Any window outside this manifold scores high
-on reconstruction error — that IS the anomaly signal.
-
-**Phase 2 — Joint AE + RUL fine-tuning**
-Combined loss on all windows:
-```
-loss = MSE(reconstruction) + 0.5 × asymmetric_RUL_loss
-```
-The asymmetric RUL loss (NASA scoring function) penalises optimistic predictions
-harder than pessimistic ones — reflecting the safety cost of underestimating
-remaining life.
-
-**Features**
-- 14 CMAPSS sensors after dropping 7 near-zero-variance sensors
-- `cycle_norm = current_cycle / max_cycle` as 15th feature — gives the RUL
-  head explicit temporal context critical for test set generalisation
-- Training windows rebalanced 3× oversample for high-RUL windows to reduce
-  systematic underprediction of healthy engines
-
-**Threshold calibration**
-```
-threshold = μ + 2.5σ  (of healthy training reconstruction errors)
+```bash
+docker compose up -d
 ```
 
-### Why LSTM beats EKF on gradual degradation
+### Endpoints
 
-| EKF weakness | LSTM advantage |
-|-------------|---------------|
-| Treats each sensor independently | Detects joint cross-sensor drift |
-| Fast adaptation tracks slow drift, misses it | Fixed healthy baseline — drift IS the signal |
-| Reacts to current cycle only | 30-cycle window accumulates trajectory evidence |
-| High false alarm rate (2.02/100) | Lower false alarm rate (0.66/100) |
-| Misses 67% of fault zone (recall 33%) | Catches 89% of fault zone |
+| Method | Endpoint            | Description                              |
+|--------|---------------------|------------------------------------------|
+| GET    | `/health`           | Liveness check + loaded subsets          |
+| GET    | `/models`           | List checkpoints with RMSE / NASA score  |
+| POST   | `/predict`          | Single window → anomaly score + RUL      |
+| POST   | `/predict/batch`    | Batch inference (up to 512 windows)      |
+| GET    | `/metrics/{subset}` | Stored test metrics for a subset         |
 
-**Where EKF still wins:** sudden step-change faults (stuck sensor, locked valve)
-— EKF innovation spikes in 1 cycle, LSTM needs 3–5 cycles.
+Interactive docs: **`http://localhost:8000/docs`**
 
----
+### Example request
 
-## 📐 Metrics — `metrics.py`
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"subset": "FD001", "window": [[...30 timesteps × 15 sensors...]]}'
+```
 
-Every number on the dashboard is computed by a named function. No hardcoded values.
+```json
+{
+  "anomaly_score": 0.312,
+  "rul_cycles": 47.3,
+  "is_anomaly": false,
+  "threshold": 0.434,
+  "per_sensor_mse": [0.21, 0.18, ...],
+  "top_sensor_idx": 3,
+  "latency_ms": 8.2
+}
+```
 
-| Function | What it computes |
-|----------|-----------------|
-| `rmse` | √ mean squared RUL error |
-| `nasa_score` | Asymmetric penalty — late predictions 1.5× harder |
-| `mean_absolute_error` | Linear RUL error |
-| `binary_labels` | Threshold → 0/1 per cycle |
-| `binary_labels_persistent` | Require N consecutive cycles above threshold |
-| `detection_lead_time` | Cycles of warning before fault (max_lead filtered) |
-| `early_detection_rate` | Fraction detected ≥ min_lead cycles early |
-| `false_alarm_rate` | False alarms per 100 healthy cycles |
-| `precision_recall_f1` | TP/FP/FN → P, R, F1 |
-| `evaluate_detector` | Full fleet evaluation (micro or macro avg) |
-| `compare_detectors` | LSTM vs EKF with Δ metrics |
+### MLflow experiment tracking
 
----
+Open **`http://localhost:5000`** to compare runs side by side:
 
-## 🏗️ Model details
-
-| Component | Specification |
-|-----------|--------------|
-| Encoder | BiLSTM(128) → Dropout(0.2) → LSTM(64) |
-| Bottleneck | Dense(32, tanh) — 13:1 compression from 450 inputs |
-| Decoder | RepeatVector(30) → LSTM(64) → LSTM(128) → TimeDistributed Dense(15) |
-| RUL head | Dense(32) → ReLU → Dropout(0.1) → Dense(16) → ReLU → Dense(1, clamp[0,1]) |
-| Parameters | ~478,000 |
-| Phase 1 optimizer | Adam lr=1e-3, ReduceLROnPlateau |
-| Phase 2 optimizer | Adam lr=1e-4, ReduceLROnPlateau |
-| RUL output | Normalised [0,1] during training, × 125 at inference |
-| Threshold | μ + 2.5σ of healthy training errors |
+- All hyperparameters logged per run
+- Per-epoch AE and RUL loss curves
+- Final `test_rmse`, `test_nasa_score`, `threshold`, `train_time_min`
 
 ---
 
-## 📝 CV line
+## Project structure
 
-> *"Built FaultSense — an LSTM autoencoder predictive maintenance system trained
-> on NASA CMAPSS turbofan data. Achieves F1=93.9% vs EKF baseline F1=49.1%
-> (+44.8pp) for anomaly detection, detecting faults 19 cycles earlier by
-> learning joint multivariate sensor drift. RUL prediction reaches NASA score
-> 7,982 on 100 test engines. Deployed as interactive Streamlit dashboard with
-> real-time anomaly scoring, per-sensor attribution, and live metric computation
-> via a custom evaluation pipeline (metrics.py)."*
+```
+faultsense/
+├── models/
+│   ├── lstm_autoencoder.py   # FaultSenseModel, LSTMEncoder, RULHead
+│   └── ekf_baseline.py       # EKFBaseline — per-sensor Kalman filter
+├── api/
+│   └── main.py               # FastAPI serving layer
+├── faultsense/
+│   ├── __init__.py           # Public package API
+│   └── metrics.py            # RUL + anomaly detection metrics
+├── tests/
+│   └── test_metrics.py       # 35 pytest tests (all passing)
+├── data/
+│   ├── raw/                  # NASA .txt files (not tracked)
+│   └── processed/            # Preprocessed .pkl files (not tracked)
+├── checkpoints/              # Trained model .pt files (not tracked)
+├── preprocess.py             # NASA CMAPSS preprocessing pipeline
+├── train.py                  # Two-phase training with MLflow logging
+├── app.py                    # Streamlit dashboard
+├── metrics.py                # Evaluation utilities
+├── Dockerfile
+├── docker-compose.yml        # API + MLflow services
+├── pyproject.toml            # Installable package config
+└── requirements.txt
+```
 
 ---
 
-## 📄 License
+## Running tests
 
-MIT — free to use, modify, and build on.
+```bash
+pip install pytest pytest-cov
+pytest tests/ -v
+pytest tests/ -v --cov=metrics --cov-report=term-missing
+```
+
+Expected: **35 passed** across 7 test classes.
 
 ---
 
-## 🔗 References
+## Key design decisions
 
-- Saxena, A. et al. (2008). *Damage Propagation Modeling for Aircraft Engine Run-to-Failure Simulation.* IEEE PHM.
-- [NASA CMAPSS Dataset](https://ti.arc.nasa.gov/tech/dash/groups/pcoe/prognostic-data-repository/)
-- Hochreiter, S. & Schmidhuber, J. (1997). *Long Short-Term Memory.* Neural Computation.
-- Malhotra, P. et al. (2016). *LSTM-based Encoder-Decoder for Multi-sensor Anomaly Detection.* ICML.
+**Two-phase training** — the autoencoder is pre-trained on healthy-only windows to establish a tight reconstruction manifold before RUL fine-tuning begins. Most published implementations skip this step.
+
+**Condition-aware normalisation** — for FD002/FD004 (6 operating conditions), sensor readings are normalised within each engine × condition group after K-means clustering on the op-setting columns. The fitted K-means is saved in the preprocessed pickle and reused at test time to prevent leakage.
+
+**Asymmetric NASA loss during training** — not just at evaluation. The model learns a conservative bias: predicting an engine will fail sooner than it will is safer than the reverse.
+
+**Per-sensor attribution** — the `per_sensor_mse` field in every API response identifies which sensors drove the anomaly score, enabling targeted maintenance decisions.
+
+---
+
+## Dependencies
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| PyTorch | ≥ 2.0 | LSTM autoencoder + RUL head |
+| NumPy | ≥ 1.24 | Numerical ops |
+| scikit-learn | ≥ 1.3 | K-means clustering, preprocessing |
+| pandas | ≥ 2.0 | Data loading |
+| FastAPI | ≥ 0.111 | REST API |
+| MLflow | ≥ 2.13 | Experiment tracking |
+| Streamlit | ≥ 1.35 | Dashboard |
+
+---
+
+## References
+
+- Saxena, A. et al. (2008). *Damage Propagation Modeling for Aircraft Engine Run-to-Failure Simulation.* IEEE PHM Conference.
+- NASA Prognostics Data Repository — [CMAPSS dataset](https://ti.arc.nasa.gov/tech/dash/groups/pcoe/prognostic-data-repository/)
+
+---
+
+## Author
+
+**Mohamed Becha** — M.Sc. Mechanical Engineering, ETH Zürich  
+[GitHub](https://github.com/momo-2609) · [LinkedIn](https://linkedin.com/in/mohamed-becha-164bb61b9)
