@@ -1,6 +1,6 @@
 # FaultSense
 
-**End-to-end predictive maintenance system** — LSTM Autoencoder anomaly detection and Remaining Useful Life (RUL) prediction on NASA CMAPSS turbofan engine data, with an Extended Kalman Filter baseline, REST API, MLflow experiment tracking, and a Streamlit dashboard.
+**End-to-end predictive maintenance system** — LSTM Autoencoder anomaly detection and Remaining Useful Life (RUL) prediction on NASA CMAPSS turbofan engine data, with an Unscented Kalman Filter baseline, REST API, MLflow experiment tracking, and a Streamlit dashboard.
 
 ---
 
@@ -45,8 +45,14 @@ Raw sensor data (21 sensors × N cycles)
   ├── Alarm          =  score > μ + 2.5σ  (calibrated on healthy data)
   └── RUL prediction =  MLP(z) × 125 cycles
 
-  EKFBaseline  (models/ekf_baseline.py)
-  └── Per-sensor Kalman filter, Mahalanobis innovation score, EMA smoothing
+  UKFBaseline  (models/ukf.py)
+  ├── Per-sensor Unscented Kalman Filter — no Jacobians needed
+  ├── Merwe scaled sigma points — 2nd-order accurate
+  ├── Mahalanobis innovation score + EMA smoothing
+  └── UKFPoseEstimator — 2D robot pose estimation (LiDAR + IMU fusion demo)
+
+  SensorFusion  (models/sensor_fusion.py)
+  └── Asynchronous LiDAR (10 Hz) + IMU (100 Hz) stream fusion via UKF
 ```
 
 ---
@@ -155,7 +161,8 @@ Open **`http://localhost:5000`** to compare runs side by side:
 faultsense/
 ├── models/
 │   ├── lstm_autoencoder.py   # FaultSenseModel, LSTMEncoder, RULHead
-│   └── ekf_baseline.py       # EKFBaseline — per-sensor Kalman filter
+│   ├── ukf.py                # UKFBaseline + UKFPoseEstimator
+│   └── sensor_fusion.py      # Asynchronous LiDAR + IMU fusion
 ├── api/
 │   └── main.py               # FastAPI serving layer
 ├── faultsense/
@@ -169,7 +176,7 @@ faultsense/
 ├── checkpoints/              # Trained model .pt files (not tracked)
 ├── preprocess.py             # NASA CMAPSS preprocessing pipeline
 ├── train.py                  # Two-phase training with MLflow logging
-├── app.py                    # Streamlit dashboard
+├── app.py                    # Streamlit dashboard (4 tabs)
 ├── metrics.py                # Evaluation utilities
 ├── Dockerfile
 ├── docker-compose.yml        # API + MLflow services
@@ -196,6 +203,8 @@ Expected: **35 passed** across 7 test classes.
 **Two-phase training** — the autoencoder is pre-trained on healthy-only windows to establish a tight reconstruction manifold before RUL fine-tuning begins. Most published implementations skip this step.
 
 **Condition-aware normalisation** — for FD002/FD004 (6 operating conditions), sensor readings are normalised within each engine × condition group after K-means clustering on the op-setting columns. The fitted K-means is saved in the preprocessed pickle and reused at test time to prevent leakage.
+
+**UKF over EKF** — the Unscented Kalman Filter propagates sigma points through the exact nonlinear process model, giving 2nd-order accuracy without Jacobian derivations. The same UKF core powers both the turbofan anomaly detector and the LiDAR + IMU sensor fusion demo.
 
 **Asymmetric NASA loss during training** — not just at evaluation. The model learns a conservative bias: predicting an engine will fail sooner than it will is safer than the reverse.
 
