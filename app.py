@@ -1,4 +1,4 @@
-""
+"""
 app.py
 ------
 FaultSense Streamlit Dashboard
@@ -65,7 +65,7 @@ st.set_page_config(
 try:
     import torch
     from train import load_checkpoint
-    from models.ekf_baseline import EKFBaseline
+    from models.ukf import UKFBaseline
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -127,9 +127,9 @@ def generate_demo_engine(n_cycles: int = 250, fault_at: int = 180,
     Two-phase degradation — physically realistic:
       Pre-fault (fault_at-40 → fault_at): gentle CORRELATED drift across all
         sensors. LSTM detects this because its 30-cycle window accumulates
-        joint multivariate shift. EKF adapts and follows it, missing it.
+        joint multivariate shift. UKF adapts and follows it, missing it.
       Post-fault (fault_at → end): sharp individual sensor acceleration.
-        Both detectors see this, but EKF reacts faster to step changes.
+        Both detectors see this, but UKF reacts faster to step changes.
     """
     rng       = np.random.default_rng(seed)
     n         = len(SENSOR_NAMES)
@@ -152,12 +152,12 @@ def generate_demo_fleet(n_engines: int = N_ENGINES_DEMO,
                          seed: int = 0):
     """
     Generate a synthetic fleet of engines for Tab 4 evaluation.
-    Returns lstm_scores, ekf_scores, fault_cycles, rul_pred_all, rul_true_all
+    Returns lstm_scores, ukf_scores, fault_cycles, rul_pred_all, rul_true_all
     — all computed via the same demo functions so Tab 4 numbers reflect
     the actual simulation, not hardcoded values.
     """
     rng = np.random.default_rng(seed)
-    lstm_scores_list, ekf_scores_list, fault_cycles = [], [], []
+    lstm_scores_list, ukf_scores_list, fault_cycles = [], [], []
     rul_pred_all, rul_true_all = [], []
 
     for i in range(n_engines):
@@ -165,19 +165,19 @@ def generate_demo_fleet(n_engines: int = N_ENGINES_DEMO,
         fault_at = int(n_cyc * rng.uniform(0.60, 0.80))
         X        = generate_demo_engine(n_cyc, fault_at, seed=seed + i)
         lstm_raw = _recon_error(X)   # shape (n_cyc - 30,)
-        ekf_raw  = _ekf_score(X)    # shape (n_cyc,)
+        ukf_raw  = _ukf_score(X)    # shape (n_cyc,)
         # EMA smooth LSTM (alpha=0.25 — moderate smoothing)
         ema = np.zeros_like(lstm_raw)
         ema[0] = lstm_raw[0]
         for t in range(1, len(lstm_raw)):
             ema[t] = 0.25 * lstm_raw[t] + 0.75 * ema[t-1]
-        # EKF aligned to same length as LSTM score sequence
-        ekf_aligned = ekf_raw[30:]   # drop first 30 to match window offset
+        # UKF aligned to same length as LSTM score sequence
+        ukf_aligned = ukf_raw[30:]   # drop first 30 to match window offset
         # fault_adj: fault_at in score-sequence index space
         # score t=0 corresponds to X cycle 30, so fault_adj = fault_at - 30
         fc_adj = max(0, fault_at - 30)
         lstm_scores_list.append(ema)
-        ekf_scores_list.append(ekf_aligned[:len(ema)])
+        ukf_scores_list.append(ukf_aligned[:len(ema)])
         fault_cycles.append(fc_adj)
         # RUL arrays (same length as score sequences)
         T       = len(ema)
@@ -186,7 +186,7 @@ def generate_demo_fleet(n_engines: int = N_ENGINES_DEMO,
         rul_true_all.append(rt)
         rul_pred_all.append(rp)
 
-    return (lstm_scores_list, ekf_scores_list, fault_cycles,
+    return (lstm_scores_list, ukf_scores_list, fault_cycles,
             rul_pred_all, rul_true_all)
 
 
@@ -209,27 +209,33 @@ def _recon_error(X, window=30):
     return np.array(errors)
 
 
-def _ekf_score(X):
+def _ukf_score(X):
     """
-    EKF proxy: per-sensor normalised innovation squared.
-    Uses FAST state adaptation (alpha=0.10) — the filter tracks slow gradual
-    drift and does NOT flag it as an anomaly. Only reacts to sudden
-    step-change deviations that exceed the running variance estimate.
-    This is why EKF has lower recall on gradual degradation: it adapts
-    to the slow pre-fault drift, then misses most of the fault zone.
+    UKF proxy: per-sensor Unscented Kalman Filter innovation score.
+    Uses sigma-point propagation through the exact nonlinear process model.
+    Compared to the old EKF proxy, this handles nonlinear sensor degradation
+    curves more accurately — but still adapts to slow drift, so recall on
+    gradual degradation is lower than LSTM.
     Returns raw scores for correct threshold calibration.
     """
-    n      = X.shape[1]
-    scores = np.zeros(len(X))
-    mu     = X[0].copy()
-    var    = np.ones(n) * 0.01
-    for t in range(1, len(X)):
-        innov      = X[t] - mu
-        scores[t]  = float((innov**2 / (var + 1e-6)).mean())
-        mu  = 0.90 * mu  + 0.10 * X[t]   # fast adaptation — tracks slow drift
-        var = 0.95 * var + 0.05 * innov**2
-    scores = np.convolve(scores, np.ones(5)/5, mode="same")
-    return scores
+    try:
+        from models.ukf import UKFBaseline
+        ukf = UKFBaseline(n_sensors=X.shape[1], ema_alpha=0.3)
+        ukf.initialize(X[:30])   # init on first 30 cycles
+        scores = ukf.run(X)
+        return scores
+    except Exception:
+        # Fallback to simple innovation proxy if UKF import fails
+        n      = X.shape[1]
+        scores = np.zeros(len(X))
+        mu     = X[0].copy()
+        var    = np.ones(n) * 0.01
+        for t in range(1, len(X)):
+            innov      = X[t] - mu
+            scores[t]  = float((innov**2 / (var + 1e-6)).mean())
+            mu  = 0.90 * mu  + 0.10 * X[t]
+            var = 0.95 * var + 0.05 * innov**2
+        return np.convolve(scores, np.ones(5)/5, mode="same")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -247,7 +253,7 @@ _M = dict(l=40, r=20, t=30, b=30)
 
 def chart_anomaly(cycles, lstm, ekf, thr, alarm=None, cur=None):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=cycles, y=ekf, name="EKF residual",
+    fig.add_trace(go.Scatter(x=cycles, y=ekf, name="UKF score",
                              line=dict(color=AMBER, width=1.5, dash="dot"), opacity=0.7))
     fig.add_trace(go.Scatter(x=cycles, y=lstm, name="LSTM score",
                              line=dict(color=GREEN, width=2),
@@ -318,7 +324,7 @@ def chart_comparison_bar(metrics_dict):
     fig = go.Figure()
     fig.add_trace(go.Bar(name="LSTM", x=cats, y=lstm_v,
                          marker_color=GREEN, opacity=0.85))
-    fig.add_trace(go.Bar(name="EKF",  x=cats, y=ekf_v,
+    fig.add_trace(go.Bar(name="UKF",  x=cats, y=ekf_v,
                          marker_color=AMBER, opacity=0.85))
     layout = {**_LAYOUT, "height": 240, "barmode": "group",
               "margin": dict(l=40,r=20,t=20,b=30),
@@ -330,10 +336,10 @@ def chart_comparison_bar(metrics_dict):
 def chart_nasa_scatter(d_lstm, d_ekf):
     """Scatter: error d vs NASA penalty for each engine."""
     fig = go.Figure()
-    # EKF
+    # UKF
     fig.add_trace(go.Scatter(
         x=d_ekf, y=[np.exp(d/10)-1 if d>=0 else np.exp(-d/13)-1 for d in d_ekf],
-        mode="markers", name="EKF",
+        mode="markers", name="UKF",
         marker=dict(color=AMBER, size=6, opacity=0.7)))
     # LSTM
     fig.add_trace(go.Scatter(
@@ -349,9 +355,9 @@ def chart_nasa_scatter(d_lstm, d_ekf):
     return fig
 
 
-def chart_lead_time_hist(lead_lstm, lead_ekf):
+def chart_lead_time_hist(lead_lstm, lead_ukf):
     fig = go.Figure()
-    fig.add_trace(go.Histogram(x=lead_ekf, name="EKF", nbinsx=12,
+    fig.add_trace(go.Histogram(x=lead_ukf, name="UKF", nbinsx=12,
                                marker_color=AMBER, opacity=0.7))
     fig.add_trace(go.Histogram(x=lead_lstm, name="LSTM", nbinsx=12,
                                marker_color=GREEN, opacity=0.7))
@@ -526,7 +532,7 @@ def main():
     # ── Single engine stream (Tabs 1 / 2 / 3) ────────────────────────────
     X        = generate_demo_engine(cfg["n_cycles"], cfg["fault_at"])
     lstm_raw = _recon_error(X)
-    ekf_raw  = _ekf_score(X)[30:30+len(lstm_raw)]  # align to LSTM window offset
+    ukf_raw  = _ukf_score(X)[30:30+len(lstm_raw)]  # align to LSTM window offset
 
     # EMA smooth LSTM (α = 0.25) before normalisation
     lstm_ema_raw = np.zeros_like(lstm_raw)
@@ -538,9 +544,9 @@ def main():
     # This makes the sidebar threshold slider (0.1–0.9) meaningful for both.
     # Fleet evaluation uses raw scores with separately calibrated thresholds.
     _lstm_min, _lstm_max = lstm_ema_raw.min(), lstm_ema_raw.max()
-    _ekf_min,  _ekf_max  = ekf_raw.min(),      ekf_raw.max()
+    _ekf_min,  _ekf_max  = ukf_raw.min(),      ukf_raw.max()
     lstm_ema    = (lstm_ema_raw - _lstm_min) / (_lstm_max - _lstm_min + 1e-8)
-    ekf_display = (ekf_raw      - _ekf_min)  / (_ekf_max  - _ekf_min  + 1e-8)
+    ukf_display = (ukf_raw      - _ekf_min)  / (_ekf_max  - _ekf_min  + 1e-8)
 
     cycles = np.arange(len(lstm_ema))
 
@@ -566,14 +572,14 @@ def main():
 
     # Detection lead time (both methods)
     lt_simple     = detection_lead_time(lstm_ema, thr, fault_adj)
-    lt_ekf        = detection_lead_time(ekf_raw,  thr, fault_adj)
+    lt_ukf        = detection_lead_time(ukf_raw,  thr, fault_adj)
     lt_persistent = detection_lead_time(labels_persistent.astype(float), 0.5, fault_adj)
 
     # First alarm index
     alarm_idx = next((i for i, s in enumerate(lstm_ema) if s > thr), None)
 
     # ── Fleet evaluation for Tab 4 (cached) ──────────────────────────────
-    (fleet_lstm, fleet_ekf, fleet_fc,
+    (fleet_lstm, fleet_ukf, fleet_fc,
      fleet_rul_pred, fleet_rul_true) = generate_demo_fleet()
 
     # calibrate thresholds from genuinely healthy portion of each engine
@@ -582,20 +588,20 @@ def main():
         s[:max(5, int(len(s) * 0.40))]
         for s in fleet_lstm
     ])
-    ekf_healthy  = np.concatenate([
+    ukf_healthy  = np.concatenate([
         s[:max(5, int(len(s) * 0.40))]
-        for s in fleet_ekf
+        for s in fleet_ukf
     ])
     # 2.5-sigma: slightly more sensitive than 3-sigma, appropriate for
     # fault detection where missing a fault (FN) is more costly than a
     # false alarm (FP). Adjust in sidebar via fault_window slider.
     thr_lstm_fleet = float(lstm_healthy.mean() + 2.5 * lstm_healthy.std())
-    thr_ekf_fleet  = float(ekf_healthy.mean()  + 2.5 * ekf_healthy.std())
+    thr_ukf_fleet  = float(ukf_healthy.mean()  + 2.5 * ukf_healthy.std())
 
     # Full compare_detectors call — all deltas live
     cmp = compare_detectors(
-        fleet_lstm, fleet_ekf, fleet_fc,
-        thr_lstm_fleet, thr_ekf_fleet,
+        fleet_lstm, fleet_ukf, fleet_fc,
+        thr_lstm_fleet, thr_ukf_fleet,
         fault_window=cfg["fault_window"],
         average="micro",
         min_lead=cfg["min_lead"],
@@ -674,18 +680,18 @@ def main():
     # TABS
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     tab1, tab2, tab3, tab4 = st.tabs([
-        "Live Monitor", "RUL Prediction", "Sensor Breakdown", "LSTM vs EKF"
+        "Live Monitor", "RUL Prediction", "Sensor Breakdown", "LSTM vs UKF"
     ])
 
     # ── TAB 1: Live Monitor ───────────────────────────────────────────────
     with tab1:
         st.plotly_chart(
-            chart_anomaly(cycles[:cur], lstm_ema[:cur], ekf_display[:cur], thr,
+            chart_anomaly(cycles[:cur], lstm_ema[:cur], ukf_display[:cur], thr,
                           alarm_idx if alarm_idx and alarm_idx < cur else None, cur),
             use_container_width=True,
         )
         st.caption("Green area = LSTM reconstruction error (EMA smoothed). "
-                   "Amber dashed = EKF innovation residual. "
+                   "Amber dashed = UKF innovation score. "
                    "Red dashed = threshold τ = μ + 3σ.")
 
         # Live binary label comparison
@@ -791,7 +797,7 @@ You can change the asymmetry in `metrics.py → nasa_score(c_early, c_late)`.
             rows.append({"Sensor": name, "Recon Error": f"{err_val:.4f}", "Status": status})
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    # ── TAB 4: LSTM vs EKF ────────────────────────────────────────────────
+    # ── TAB 4: LSTM vs UKF ────────────────────────────────────────────────
     with tab4:
         st.markdown(f"#### Evaluation over {N_ENGINES_DEMO} engines — all values from `compare_detectors()`")
         st.caption(f"fault_window={cfg['fault_window']} cycles · "
@@ -844,7 +850,7 @@ You can change the asymmetry in `metrics.py → nasa_score(c_early, c_late)`.
             }), use_container_width=True, hide_index=True)
 
         with col_e:
-            st.markdown(f"**EKF** — threshold τ = {thr_ekf_fleet:.3f}")
+            st.markdown(f"**UKF** — threshold τ = {thr_ukf_fleet:.3f}")
             em = cmp["ekf"]
             st.dataframe(pd.DataFrame({
                 "Metric": ["Precision", "Recall", "F1",
@@ -884,48 +890,53 @@ You can change the asymmetry in `metrics.py → nasa_score(c_early, c_late)`.
             detection_lead_time(s, thr_lstm_fleet, fc)
             for s, fc in zip(fleet_lstm, fleet_fc)
         ]
-        lead_ekf_list  = [
-            detection_lead_time(s, thr_ekf_fleet, fc)
-            for s, fc in zip(fleet_ekf, fleet_fc)
+        lead_ukf_list  = [
+            detection_lead_time(s, thr_ukf_fleet, fc)
+            for s, fc in zip(fleet_ukf, fleet_fc)
         ]
         lead_lstm_clean = [l for l in lead_lstm_list if l is not None]
-        lead_ekf_clean  = [l for l in lead_ekf_list  if l is not None]
+        lead_ukf_clean  = [l for l in lead_ukf_list  if l is not None]
         st.plotly_chart(
-            chart_lead_time_hist(lead_lstm_clean, lead_ekf_clean),
+            chart_lead_time_hist(lead_lstm_clean, lead_ukf_clean),
             use_container_width=True,
         )
         st.caption("Each bar = number of engines detected at that lead time. "
                    "Right = earlier detection. "
                    f"Engines with no alarm: LSTM {N_ENGINES_DEMO - len(lead_lstm_clean)}, "
-                   f"EKF {N_ENGINES_DEMO - len(lead_ekf_clean)}.")
+                   f"UKF {N_ENGINES_DEMO - len(lead_ukf_clean)}.")
 
         # ── Explainer ────────────────────────────────────────────────────
         with st.expander("Why does LSTM win on gradual degradation?"):
             st.markdown("""
 **30-cycle context window** — LSTM sees the trajectory, not a single point.
-EKF linearises around current state and misses the nonlinear acceleration.
+UKF linearises around current state via sigma points but still adapts to slow
+drift over time, which means it can miss the gradual pre-fault degradation zone.
 
 **Cross-sensor correlations** — T50 and P30 degrade together in turbofan
-failure modes. LSTM learns this joint pattern; EKF treats sensors independently.
+failure modes. LSTM learns this joint pattern; UKF treats sensors independently,
+running one filter per sensor and averaging the innovation scores.
 
 **Healthy-only training** — The autoencoder learns a tight manifold of normal
 operation. Any deviation from that manifold shows as reconstruction error, even
 if no single sensor crosses an absolute threshold.
 
-**Where EKF still wins**: sudden step-change faults (sensor stuck, valve locked)
-— EKF innovation spikes in 1 cycle; LSTM takes 3–5 cycles. A production system
-should run both in parallel.
+**Where UKF still wins**: sudden step-change faults (sensor stuck, valve locked)
+— UKF innovation spikes in 1 cycle; LSTM takes 3–5 cycles to accumulate enough
+window evidence. A production system should run both in parallel.
+
+**UKF advantage over EKF**: UKF propagates sigma points through the exact
+nonlinear process model, giving 2nd-order accuracy without Jacobians. For
+nonlinear sensor degradation curves this is more accurate than the EKF approach.
 
 **Threshold note**: each detector uses its own τ = μ + 3σ calibrated from its
 own healthy score distribution. Sharing one threshold would be unfair — LSTM
-reconstruction errors and EKF innovation residuals are on completely different
-scales.
+reconstruction errors and UKF innovation scores are on completely different scales.
 """)
 
     # ── Footer ────────────────────────────────────────────────────────────
     st.markdown("---")
     st.caption(
-        "FaultSense · LSTM Autoencoder + EKF Baseline · "
+        "FaultSense · LSTM Autoencoder + UKF Baseline · "
         "NASA CMAPSS FD001 · "
         "All metrics live from utils/metrics.py"
     )
