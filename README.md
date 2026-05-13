@@ -8,12 +8,12 @@
 
 | Subset | Conditions | Fault modes | Test RMSE (cycles) | NASA Score |
 |--------|-----------|-------------|-------------------|------------|
-| FD001  | 1         | 1           | ~50               | ~15 000    |
-| FD002  | 6         | 1           | —                 | —          |
-| FD003  | 1         | 2           | —                 | —          |
-| FD004  | 6         | 2           | —                 | —          |
+| FD001  | 1         | 1           | 48.0              | 11637        |
+| FD002  | 6         | 1           | 50.1              | 12196        |
+| FD003  | 1         | 2           | 45.9              | 10469        |
+| FD004  | 6         | 2           | 55.9              | 20502        |
 
-> Lower is better for both metrics. FD001 trained; FD002–FD004 in progress.
+> Lower is better for both metrics.
 
 ---
 
