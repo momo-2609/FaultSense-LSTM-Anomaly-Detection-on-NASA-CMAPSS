@@ -19,7 +19,7 @@ from typing import Optional, Tuple
 
 
 class LSTMEncoder(nn.Module):
-    """Bidirectional LSTM encoder → fixed-size latent vector."""
+    """Bidirectional LSTM encoder → fixed-size latent vector with attention."""
 
     def __init__(self, n_sensors: int, hidden: int = 128, latent: int = 32,
                  dropout: float = 0.2):
@@ -32,25 +32,27 @@ class LSTMEncoder(nn.Module):
             bidirectional=True,
         )
         self.dropout = nn.Dropout(dropout)
-        # Second LSTM reduces bidirectional output → single direction
         self.lstm2 = nn.LSTM(
-            input_size=hidden * 2,   # fwd + bwd concatenated
+            input_size=hidden * 2,
             hidden_size=hidden,
             num_layers=1,
             batch_first=True,
         )
+        # Temporal attention: learn a scalar weight per timestep.
+        # Later cycles (closer to prediction point) get higher weight
+        # for degrading engines, giving better temporal localisation.
+        self.attention    = nn.Linear(hidden, 1)
         self.fc_bottleneck = nn.Linear(hidden, latent)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x : (B, T, n_sensors)
-        returns: (B, latent)
-        """
-        out, _ = self.bilstm(x)          # (B, T, 2*hidden)
+        """x : (B, T, n_sensors) → (B, latent)"""
+        out, _ = self.bilstm(x)               # (B, T, 2*hidden)
         out    = self.dropout(out)
-        out, (h, _) = self.lstm2(out)    # h : (1, B, hidden)
-        h = h.squeeze(0)                 # (B, hidden)
-        z = torch.tanh(self.fc_bottleneck(h))   # (B, latent)
+        out, _ = self.lstm2(out)              # (B, T, hidden)
+        # Weighted sum over timesteps
+        attn_w  = torch.softmax(self.attention(out), dim=1)  # (B, T, 1)
+        context = (attn_w * out).sum(dim=1)                  # (B, hidden)
+        z = torch.tanh(self.fc_bottleneck(context))          # (B, latent)
         return z
 
 
@@ -130,16 +132,14 @@ class LSTMAutoencoder(nn.Module):
 
 
 class RULHead(nn.Module):
-    """
-    Optional regression head attached after the encoder.
-    Shares encoder weights; adds a small MLP for RUL prediction.
-    """
-
     def __init__(self, latent: int = 32, rul_cap: float = 125.0):
         super().__init__()
         self.rul_cap = rul_cap
         self.mlp = nn.Sequential(
-            nn.Linear(latent, 32),
+            nn.Linear(latent, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 32),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(32, 16),
@@ -147,10 +147,9 @@ class RULHead(nn.Module):
             nn.Linear(16, 1),
         )
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """z : (B, latent) → rul_pred : (B,)"""
+    def forward(self, z):
         rul = self.mlp(z).squeeze(-1)
-        return torch.clamp(rul, 0.0, 1.0)  # normalised — multiply by rul_cap at inference
+        return torch.clamp(rul, 0.0, 1.0)
 
 
 class FaultSenseModel(nn.Module):
@@ -219,7 +218,7 @@ class FaultSenseModel(nn.Module):
         rul      = rul_pred.cpu().numpy()
 
         # Denormalise RUL from [0,1] training space → cycles
-        rul_cycles = rul * self.rul_head.rul_cap
+        rul_cycles = rul
         result = {
             "anomaly_score":  score[0]      if single else score,
             "rul":            rul_cycles[0] if single else rul_cycles,
