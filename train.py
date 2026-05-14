@@ -11,13 +11,12 @@ Usage:
 """
 
 import argparse
+import os
 import pickle
 import sys
 import time
 from pathlib import Path
 
-# Ensure the project root is on sys.path so 'models' is importable
-# regardless of which directory python is launched from
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
@@ -32,28 +31,50 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from models.lstm_autoencoder import FaultSenseModel, count_params
 
+import mlflow
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
-    "hidden":       128,
+    "hidden":      128,
     "latent":       32,
     "seq_len":      30,
     "dropout":      0.2,
-    "rul_cap":      125.0,
-    "ae_epochs":    50,     # more epochs — AE needs longer to converge
-    "ae_lr":        1e-3,
+    "rul_cap":    125.0,
+    "ae_epochs":    50,
+    "ae_lr":       1e-3,
     "ae_batch":     64,
-    "rul_epochs":   100,     # more epochs for RUL head to generalise to test set
-    "rul_lr":       1e-4,   # slightly lower lr for more stable convergence
+    "rul_epochs":  100,
+    "rul_lr":      1e-4,
     "rul_batch":    64,
-    "rul_weight":   0.5,    # increase RUL weight — model was underweighting it
-    "patience":     30,     # more patience before early stop
+    "rul_weight":   0.5,
+    "patience":     30,
     "grad_clip":    1.0,
     "k_sigma":      2.5,
+    "oversample":   3.0,
 }
 
 ALL_SUBSETS = ["FD001", "FD002", "FD003", "FD004"]
+
+# ── Per-subset overrides ──────────────────────────────────────────────────────
+# FD001/FD003: 1 operating condition → AE loss converges very low (~0.30)
+# quickly, starving the RUL head. rul_weight must be higher + faster lr.
+# FD002/FD004: 6 operating conditions → AE loss stays higher (~0.50).
+SUBSET_CONFIG = {
+    "FD001": {"rul_weight": 2.0,   # was 0.3 — AE loss is now ~0.004 so needs rebalancing
+          "oversample": 8.0, "rul_lr": 1e-3,
+          "ae_epochs": 30, "patience": 25, "rul_epochs": 150},
+    "FD002": {"rul_weight": 2.0,   # was 0.3 — AE loss is now ~0.004 so needs rebalancing
+          "oversample": 8.0, "rul_lr": 1e-3,
+          "ae_epochs": 30, "patience": 25, "rul_epochs": 150},
+    "FD003": {"rul_weight": 2.0,   # was 0.3 — AE loss is now ~0.004 so needs rebalancing
+          "oversample": 8.0, "rul_lr": 1e-3,
+          "ae_epochs": 30, "patience": 25, "rul_epochs": 150},
+    "FD004": {"rul_weight": 2.0,   # was 0.3 — AE loss is now ~0.004 so needs rebalancing
+          "oversample": 8.0, "rul_lr": 1e-3,
+          "ae_epochs": 30, "patience": 25, "rul_epochs": 150},
+}
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -77,13 +98,16 @@ def make_loader(X: np.ndarray, y: np.ndarray = None,
 def ae_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return F.mse_loss(recon, target)
 
-
-def rul_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
-    """Asymmetric NASA loss — late predictions penalised harder."""
-    d = pred - true
-    return torch.where(d > 0,
-                        torch.exp(d / 10) - 1,
-                        torch.exp(-d / 13) - 1).mean()
+""" def nasa_loss(pred, true, rul_cap=125.0):
+    err = (pred - true) * rul_cap / rul_cap   # already normalized, just use directly
+    # Actually simplifies to:
+    err = pred - true    # both in [0,1], errors are small → no explosion
+    loss = torch.where(
+        err >= 0,
+        torch.exp(err / (13.0 / rul_cap)) - 1,
+        torch.exp(-err / (10.0 / rul_cap)) - 1,
+    )
+    return loss.mean() """
 
 
 # ── Early stopping ────────────────────────────────────────────────────────────
@@ -149,8 +173,12 @@ def train_phase1(model, ae_loader, val_loader, cfg, device):
     return history
 
 
-def train_phase2(model, train_loader, val_loader, cfg, device):
-    """Phase 2: joint AE + RUL fine-tuning on all windows."""
+def train_phase2(model, train_loader, val_loader, cfg, device, eval_cap=125.0):
+    """
+    Phase 2: joint AE + RUL fine-tuning.
+    Uses F.mse_loss for training (stable gradients) — NOT asymmetric NASA loss.
+    NASA loss is used only for final evaluation.
+    """
     print("\n── Phase 2: Joint AE + RUL fine-tuning ──")
     opt     = Adam(model.parameters(), lr=cfg["rul_lr"])
     sched   = ReduceLROnPlateau(opt, patience=5, factor=0.5)
@@ -164,8 +192,10 @@ def train_phase2(model, train_loader, val_loader, cfg, device):
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
             recon, rul_pred, _ = model(X_batch)
+            # AFTER
+            # TEMPORARY — remove nasa_loss entirely to get stable training
             loss = (ae_loss(recon, X_batch)
-                    + cfg["rul_weight"] * rul_loss(rul_pred, y_batch))
+            + cfg["rul_weight"] * F.mse_loss(rul_pred, y_batch))
             opt.zero_grad(); loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
             opt.step()
@@ -181,19 +211,17 @@ def train_phase2(model, train_loader, val_loader, cfg, device):
                 v_losses.append(ae_loss(recon, X_batch).item())
                 v_rul.append(F.mse_loss(rul_pred, y_batch).item())
 
-        tl, vl = np.mean(t_losses), np.mean(v_losses)
-        # Monitor RUL RMSE for scheduling and early stopping — not AE loss
-        # AE loss plateaus quickly; RUL generalisation is what we care about
-        rul_rmse = np.sqrt(np.mean(v_rul)) * cfg["rul_cap"]
+        tl, vl   = np.mean(t_losses), np.mean(v_losses)
+        rul_rmse = np.sqrt(np.mean(v_rul)) * eval_cap   # denormalize for display
         history["train"].append(tl)
         history["val"].append(vl)
-        sched.step(rul_rmse)   # reduce LR when RUL stops improving
+        sched.step(rul_rmse)
 
         if epoch % 5 == 0 or epoch == 1:
             print(f"  Epoch {epoch:3d}/{cfg['rul_epochs']}  "
                   f"train={tl:.5f}  val={vl:.5f}  "
                   f"RUL-RMSE={rul_rmse:.1f} cyc")
-        if stopper(rul_rmse):  # stop when RUL stops improving
+        if stopper(rul_rmse):
             print(f"  Early stop at epoch {epoch}")
             break
 
@@ -208,7 +236,7 @@ def evaluate_test(model, X_test, y_test, device, rul_cap=125.0):
     model.eval()
     X_t = torch.from_numpy(X_test).float().to(device)
     _, rul_pred, _ = model(X_t)
-    pred = rul_pred.cpu().numpy() * rul_cap
+    pred = rul_pred.cpu().numpy() * rul_cap   # back to cycles
     true = y_test
 
     rmse  = float(np.sqrt(np.mean((pred - true) ** 2)))
@@ -222,7 +250,7 @@ def evaluate_test(model, X_test, y_test, device, rul_cap=125.0):
     print(f"  Pred mean={pred.mean():.1f}  std={pred.std():.1f}")
     print(f"  True mean={true.mean():.1f}  std={true.std():.1f}")
     errors = np.abs(pred - true)
-    worst = np.argsort(errors)[-5:]
+    worst  = np.argsort(errors)[-5:]
     print("  Worst 5: " + ", ".join(
         f"#{i} pred={pred[i]:.0f} true={true[i]:.0f}" for i in worst))
     return {"rmse": rmse, "score": score, "pred": pred, "true": true}
@@ -232,50 +260,50 @@ def evaluate_test(model, X_test, y_test, device, rul_cap=125.0):
 
 def train_subset(subset: str, data_dir: str, ckpt_dir: str,
                   cfg: dict, device: str) -> None:
-    """Full training pipeline for one CMAPSS subset."""
     print(f"\n{'='*55}")
     print(f"Training on {subset}")
     print(f"{'='*55}")
 
-    # Load preprocessed data
+    # Apply subset-specific overrides
+    cfg = {**cfg, **SUBSET_CONFIG.get(subset, {})}
+    print(f"  rul_weight={cfg['rul_weight']}  "
+          f"rul_lr={cfg['rul_lr']}  "
+          f"oversample={cfg.get('oversample', 3.0)}  "
+          f"ae_epochs={cfg['ae_epochs']}")
+
     pkl = Path(data_dir) / f"cmapss_{subset.lower()}.pkl"
     if not pkl.exists():
-        print(f"\nERROR: {pkl} not found.")
-        print(f"Run:  python data/preprocess.py --subset {subset}")
+        print(f"\nERROR: {pkl} not found. Run: python preprocess.py --subset {subset}")
         return
 
-    data = load_data(str(pkl))
+    data      = load_data(str(pkl))
     n_sensors = len(data["sensor_cols"])
+    train_cap = data.get("rul_train_cap", cfg["rul_cap"])
+    eval_cap  = data.get("rul_cap", cfg["rul_cap"])
+
     print(f"Sensors: {n_sensors}  |  "
           f"Train: {data['X_train'].shape[0]:,} windows  |  "
           f"Val: {data['X_val'].shape[0]:,} windows  |  "
           f"Test: {data['X_test'].shape[0]} engines")
 
-    # Data loaders
-    ae_loader    = make_loader(data["X_ae"],    batch_size=cfg["ae_batch"])
+    ae_loader     = make_loader(data["X_ae"], batch_size=cfg["ae_batch"])
+    val_ae_loader = make_loader(data["X_val"], batch_size=256, shuffle=False)
 
-    # Rebalance: oversample high-RUL windows (cap zone) to fix
-    # systematic underprediction. Model sees too few high-RUL examples
-    # because engines spend more cycles near failure than near start.
-    y_norm = data["y_train"] / cfg["rul_cap"]
-    # Give 3x weight to windows with RUL > 0.8 (near-healthy)
-    weights = np.where(y_norm > 0.8, 3.0, 1.0)
+    # Keep this as before — normalized targets
+    y_raw   = data["y_train"] / train_cap      # back to [0, 1]
+    weights = np.where(y_raw >= 1.0, cfg.get("oversample", 3.0), 1.0)
     weights = weights / weights.sum()
-    n = len(data["X_train"])
+    n   = len(data["X_train"])
     idx = np.random.default_rng(42).choice(n, size=n, replace=True, p=weights)
-    X_bal = data["X_train"][idx]
-    y_bal = y_norm[idx]
+    X_bal, y_bal = data["X_train"][idx], y_raw[idx]
     train_loader = make_loader(X_bal, y_bal, batch_size=cfg["rul_batch"])
-    # AE val loader — no labels, used for Phase 1 and threshold calibration
-    val_ae_loader  = make_loader(data["X_val"], batch_size=256, shuffle=False)
-    # RUL val loader — with labels, used for Phase 2
+
     val_rul_loader = make_loader(
-        data["X_val"],
-        data["y_val"] / cfg["rul_cap"],
-        batch_size=256, shuffle=False
+    data["X_val"],
+    data["y_val"] / train_cap,   # normalized
+    batch_size=256, shuffle=False
     )
 
-    # Model
     model = FaultSenseModel(
         n_sensors=n_sensors,
         hidden=cfg["hidden"],
@@ -286,44 +314,73 @@ def train_subset(subset: str, data_dir: str, ckpt_dir: str,
     ).to(device)
     print(f"Parameters: {count_params(model):,}")
 
-    # Train
-    t0 = time.time()
-    h1 = train_phase1(model, ae_loader,    val_ae_loader, cfg, device)
-    h2 = train_phase2(model, train_loader, val_rul_loader, cfg, device)
-    print(f"\nTraining time: {(time.time()-t0)/60:.1f} min")
+    # ── MLflow run ────────────────────────────────────────────────────────
+    mlflow.set_experiment("FaultSense")
+    with mlflow.start_run(run_name=subset):
 
-    # Calibrate threshold
-    model.calibrate_threshold(
-        data["X_ae"], k_sigma=cfg["k_sigma"], device=device
-    )
+        mlflow.log_params({
+            "subset":      subset,
+            "hidden":      cfg["hidden"],
+            "latent":      cfg["latent"],
+            "seq_len":     cfg["seq_len"],
+            "dropout":     cfg["dropout"],
+            "rul_weight":  cfg["rul_weight"],
+            "rul_lr":      cfg["rul_lr"],
+            "ae_epochs":   cfg["ae_epochs"],
+            "rul_epochs":  cfg["rul_epochs"],
+            "oversample":  cfg.get("oversample", 3.0),
+            "train_cap":   train_cap,
+            "k_sigma":     cfg["k_sigma"],
+            "n_sensors":   n_sensors,
+        })
 
-    # Evaluate on test set
-    test_results = evaluate_test(
-        model, data["X_test"], data["y_test"], device, cfg["rul_cap"]
-    )
+        t0 = time.time()
+        h1 = train_phase1(model, ae_loader, val_ae_loader, cfg, device)
+        h2 = train_phase2(model, train_loader, val_rul_loader, cfg, device,
+                          eval_cap=eval_cap)
+        train_time = time.time() - t0
+        print(f"\nTraining time: {train_time/60:.1f} min")
 
-    # Save checkpoint
-    ckpt_path = Path(ckpt_dir) / f"faultsense_{subset.lower()}.pt"
-    Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "subset":       subset,
-        "model_state":  model.state_dict(),
-        "config":       cfg,
-        "threshold":    model.threshold,
-        "sensor_cols":  data["sensor_cols"],
-        "n_conditions": data["n_conditions"],
-        "history_ae":   h1,
-        "history_rul":  h2,
-        "test_results": test_results,
-    }, str(ckpt_path))
-    print(f"\nCheckpoint saved → {ckpt_path}")
+        # Log loss curves
+        for epoch, (tl, vl) in enumerate(zip(h1["train"], h1["val"]), 1):
+            mlflow.log_metrics({"ae_train_loss": tl, "ae_val_loss": vl}, step=epoch)
+        for epoch, (tl, vl) in enumerate(zip(h2["train"], h2["val"]), 1):
+            mlflow.log_metrics({"rul_train_loss": tl, "rul_val_loss": vl}, step=epoch)
+
+        model.calibrate_threshold(data["X_ae"], k_sigma=cfg["k_sigma"], device=device)
+
+        test_results = evaluate_test(model, data["X_test"], data["y_test"],
+                                      device, eval_cap)
+
+        mlflow.log_metrics({
+            "test_rmse":       round(test_results["rmse"], 2),
+            "test_nasa_score": round(test_results["score"], 1),
+            "threshold":       round(float(model.threshold), 5),
+            "train_time_min":  round(train_time / 60, 2),
+        })
+
+        ckpt_path = Path(ckpt_dir) / f"faultsense_{subset.lower()}.pt"
+        Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "subset":       subset,
+            "model_state":  model.state_dict(),
+            "config":       cfg,
+            "threshold":    model.threshold,
+            "sensor_cols":  data["sensor_cols"],
+            "n_conditions": data["n_conditions"],
+            "history_ae":   h1,
+            "history_rul":  h2,
+            "test_results": test_results,
+            "mlflow_run_id": mlflow.active_run().info.run_id,
+        }, str(ckpt_path))
+        print(f"\nCheckpoint saved → {ckpt_path}")
+        print(f"MLflow run ID:    {mlflow.active_run().info.run_id}")
 
 
 # ── Checkpoint loading ────────────────────────────────────────────────────────
 
-def load_checkpoint(path: str, device: str = "cpu") -> FaultSenseModel:
-    """Load a saved model for inference. Returns model with threshold set."""
-    ckpt  = torch.load(path, map_location=device)
+def load_checkpoint(path: str, device: str = "cpu"):
+    ckpt  = torch.load(path, map_location=device, weights_only=False)
     cfg   = ckpt["config"]
     model = FaultSenseModel(
         n_sensors=len(ckpt["sensor_cols"]),
@@ -343,31 +400,33 @@ def load_checkpoint(path: str, device: str = "cpu") -> FaultSenseModel:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(args):
-    cfg    = DEFAULT_CONFIG.copy()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
+
+    # MLflow tracking URI
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+    try:
+        mlflow.set_tracking_uri(tracking_uri)
+        mlflow.search_experiments()
+        print(f"MLflow tracking: {tracking_uri}")
+    except Exception:
+        mlflow.set_tracking_uri("mlruns")
+        print("MLflow tracking: ./mlruns (local fallback)")
 
     script_dir = Path(__file__).resolve().parent
     data_dir   = args.data or str(script_dir / "data" / "processed")
     ckpt_dir   = args.out  or str(script_dir / "checkpoints")
 
-    if args.all:
-        subsets = ALL_SUBSETS
-    else:
-        subsets = args.subset or ["FD001"]
+    subsets = ALL_SUBSETS if args.all else (args.subset or ["FD001"])
 
     for subset in subsets:
-        train_subset(subset, data_dir, ckpt_dir, cfg, device)
+        train_subset(subset, data_dir, ckpt_dir, DEFAULT_CONFIG.copy(), device)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--subset", nargs="+", choices=ALL_SUBSETS,
-                        help="Subsets to train (default: FD001)")
-    parser.add_argument("--all",   action="store_true",
-                        help="Train all 4 subsets sequentially")
-    parser.add_argument("--data",  default=None,
-                        help="Path to processed data directory")
-    parser.add_argument("--out",   default=None,
-                        help="Path to save checkpoints")
+    parser.add_argument("--subset", nargs="+", choices=ALL_SUBSETS)
+    parser.add_argument("--all",   action="store_true")
+    parser.add_argument("--data",  default=None)
+    parser.add_argument("--out",   default=None)
     main(parser.parse_args())
