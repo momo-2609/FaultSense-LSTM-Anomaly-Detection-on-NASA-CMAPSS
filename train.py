@@ -1,18 +1,29 @@
 """
 train.py
 --------
-Training script for FaultSense — supports all 4 CMAPSS subsets.
+Training script for FaultSense simple LSTM (paper Algorithm 5).
+No autoencoder pre-training phase — single RUL regression stage only.
+
+Training spec (matching paper):
+  Optimiser  : RMSprop, lr=0.001, weight_decay=1e-5
+  Loss       : MSE(rul_pred, rul_true)  — targets normalised to [0, 1]
+  Batch size : 64
+  Scheduler  : ReduceLROnPlateau, factor=0.5, patience=5
+  Early stop : patience=20 epochs on val MSE loss
+  Max epochs : 200
+  Seed       : 42
 
 Usage:
   python train.py                         # train on FD001
-  python train.py --subset FD002          # train on FD002
-  python train.py --subset FD001 FD002    # train multiple subsets
-  python train.py --all                   # train all 4 subsets
+  python train.py --subset FD002
+  python train.py --subset FD001 FD002
+  python train.py --all
 """
 
 import argparse
 import os
 import pickle
+import random
 import sys
 import time
 from pathlib import Path
@@ -26,54 +37,73 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-from torch.optim import Adam
+from torch.optim import RMSprop
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from models.lstm_autoencoder import FaultSenseModel, count_params
 
 import mlflow
 
+# ── Global seed ───────────────────────────────────────────────────────────────
+SEED = 42
+
+def set_seed(seed: int = SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+set_seed(SEED)
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
-    "hidden":      128,
-    "latent":       32,
-    "seq_len":      30,
-    "dropout":      0.2,
-    "rul_cap":    125.0,
-    "ae_epochs":    50,
-    "ae_lr":       1e-3,
-    "ae_batch":     64,
-    "rul_epochs":  100,
-    "rul_lr":      1e-4,
-    "rul_batch":    64,
-    "rul_weight":   0.5,
-    "patience":     30,
-    "grad_clip":    1.0,
-    "k_sigma":      2.5,
-    "oversample":   3.0,
+    # Model — matches Algorithm 5
+    "hidden":        32,      # LSTM hidden size
+    "dropout":       0.5,     # dropout on last hidden state
+    "rul_cap":      130.0,    # matches preprocess RUL_CAP
+
+    # Training — matches paper spec
+    "epochs":       200,      # max epochs
+    "lr":           1e-3,     # RMSprop learning rate
+    "weight_decay": 1e-5,     # RMSprop weight decay
+    "batch_size":    64,      # batch size
+    "patience":      20,      # early stop patience
+    "sched_factor":  0.5,     # LR scheduler reduction factor
+    "sched_patience": 5,      # LR scheduler patience
+    "grad_clip":     1.0,     # gradient norm clipping
+
+    # Sampling
+    "oversample":    2.0,     # weight multiplier for high-RUL windows
+
+    # Anomaly detection (stub — no AE)
+    "k_sigma":       2.5,
+
+    # Legacy keys kept so load_checkpoint stays compatible
+    "latent":        32,
+    "seq_len":       30,
+    "ae_epochs":      0,
+    "ae_lr":         1e-3,
+    "ae_wd":         1e-5,
+    "ae_batch":       64,
+    "rul_weight":     1.0,
+    "rul_lr":         1e-3,
+    "rul_wd":         1e-5,
+    "rul_batch":       64,
+    "rul_epochs":    200,
+    "sched_patience_rul": 5,
 }
 
 ALL_SUBSETS = ["FD001", "FD002", "FD003", "FD004"]
 
-# ── Per-subset overrides ──────────────────────────────────────────────────────
-# FD001/FD003: 1 operating condition → AE loss converges very low (~0.30)
-# quickly, starving the RUL head. rul_weight must be higher + faster lr.
-# FD002/FD004: 6 operating conditions → AE loss stays higher (~0.50).
+# Per-subset overrides — empty by default, add here to tune per subset
 SUBSET_CONFIG = {
-    "FD001": {"rul_weight": 2.0,   # was 0.3 — AE loss is now ~0.004 so needs rebalancing
-          "oversample": 8.0, "rul_lr": 1e-3,
-          "ae_epochs": 30, "patience": 25, "rul_epochs": 150},
-    "FD002": {"rul_weight": 2.0,   # was 0.3 — AE loss is now ~0.004 so needs rebalancing
-          "oversample": 8.0, "rul_lr": 1e-3,
-          "ae_epochs": 30, "patience": 25, "rul_epochs": 150},
-    "FD003": {"rul_weight": 2.0,   # was 0.3 — AE loss is now ~0.004 so needs rebalancing
-          "oversample": 8.0, "rul_lr": 1e-3,
-          "ae_epochs": 30, "patience": 25, "rul_epochs": 150},
-    "FD004": {"rul_weight": 2.0,   # was 0.3 — AE loss is now ~0.004 so needs rebalancing
-          "oversample": 8.0, "rul_lr": 1e-3,
-          "ae_epochs": 30, "patience": 25, "rul_epochs": 150},
+    "FD001": {},
+    "FD002": {},
+    "FD003": {},
+    "FD004": {},
 }
 
 
@@ -84,36 +114,21 @@ def load_data(path: str) -> dict:
         return pickle.load(f)
 
 
-def make_loader(X: np.ndarray, y: np.ndarray = None,
+def make_loader(X: np.ndarray, y: np.ndarray,
                 batch_size: int = 64, shuffle: bool = True) -> DataLoader:
-    X_t = torch.from_numpy(X).float()
-    ds  = TensorDataset(X_t, torch.from_numpy(y).float()) if y is not None \
-          else TensorDataset(X_t)
+    ds = TensorDataset(
+        torch.from_numpy(X).float(),
+        torch.from_numpy(y).float(),
+    )
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       num_workers=0, pin_memory=torch.cuda.is_available())
-
-
-# ── Losses ────────────────────────────────────────────────────────────────────
-
-def ae_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    return F.mse_loss(recon, target)
-
-""" def nasa_loss(pred, true, rul_cap=125.0):
-    err = (pred - true) * rul_cap / rul_cap   # already normalized, just use directly
-    # Actually simplifies to:
-    err = pred - true    # both in [0,1], errors are small → no explosion
-    loss = torch.where(
-        err >= 0,
-        torch.exp(err / (13.0 / rul_cap)) - 1,
-        torch.exp(-err / (10.0 / rul_cap)) - 1,
-    )
-    return loss.mean() """
 
 
 # ── Early stopping ────────────────────────────────────────────────────────────
 
 class EarlyStopping:
-    def __init__(self, patience: int = 10, min_delta: float = 1e-5):
+    """Stop when val loss does not improve for `patience` consecutive epochs."""
+    def __init__(self, patience: int = 20, min_delta: float = 1e-6):
         self.patience  = patience
         self.min_delta = min_delta
         self.counter   = 0
@@ -128,102 +143,81 @@ class EarlyStopping:
         return self.counter >= self.patience
 
 
-# ── Training phases ───────────────────────────────────────────────────────────
+# ── Training ──────────────────────────────────────────────────────────────────
 
-def train_phase1(model, ae_loader, val_loader, cfg, device):
-    """Phase 1: AE pre-training on healthy-only windows."""
-    print("\n── Phase 1: Autoencoder pre-training (healthy only) ──")
-    opt     = Adam(model.autoencoder.parameters(), lr=cfg["ae_lr"])
-    sched   = ReduceLROnPlateau(opt, patience=5, factor=0.5)
+def train_model(model, train_loader, val_loader, cfg, device, eval_cap=130.0):
+    """
+    Single-stage RUL training — Algorithm 5.
+
+    Loss       : MSE(rul_pred, rul_true)  both in [0, 1]
+    Optimiser  : RMSprop(lr, weight_decay)
+    Scheduler  : ReduceLROnPlateau(factor=0.5, patience=5) on val MSE
+    Early stop : patience=20 on val MSE
+    Best weights saved and restored before returning.
+    """
+    print("\n── Training LSTM RUL model ──")
+    opt = RMSprop(
+        model.parameters(),
+        lr=cfg["lr"],
+        weight_decay=cfg["weight_decay"],
+    )
+    sched   = ReduceLROnPlateau(opt, factor=cfg["sched_factor"],
+                                 patience=cfg["sched_patience"], verbose=False)
     stopper = EarlyStopping(patience=cfg["patience"])
     history = {"train": [], "val": []}
 
-    for epoch in range(1, cfg["ae_epochs"] + 1):
+    best_val   = np.inf
+    best_state = None
+
+    for epoch in range(1, cfg["epochs"] + 1):
+        # ── Train ──────────────────────────────────────────────────────────
         model.train()
         t_losses = []
-        for (X_batch,) in ae_loader:
-            X_batch = X_batch.to(device)
-            recon, _ = model.autoencoder(X_batch)
-            loss = ae_loss(recon, X_batch)
-            opt.zero_grad(); loss.backward()
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            _, rul_pred, _   = model(X_batch)
+            loss = F.mse_loss(rul_pred, y_batch)
+            opt.zero_grad()
+            loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
             opt.step()
             t_losses.append(loss.item())
 
+        # ── Validate ───────────────────────────────────────────────────────
         model.eval()
         v_losses = []
         with torch.no_grad():
-            for (X_batch,) in val_loader:
-                X_batch = X_batch.to(device)
-                recon, _ = model.autoencoder(X_batch)
-                v_losses.append(ae_loss(recon, X_batch).item())
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                _, rul_pred, _   = model(X_batch)
+                v_losses.append(F.mse_loss(rul_pred, y_batch).item())
 
-        tl, vl = np.mean(t_losses), np.mean(v_losses)
+        tl       = np.mean(t_losses)
+        vl       = np.mean(v_losses)
+        rul_rmse = np.sqrt(vl) * eval_cap   # display in cycles
+
         history["train"].append(tl)
         history["val"].append(vl)
         sched.step(vl)
 
-        if epoch % 5 == 0 or epoch == 1:
-            print(f"  Epoch {epoch:3d}/{cfg['ae_epochs']}  "
-                  f"train={tl:.5f}  val={vl:.5f}")
+        # Save best
+        if vl < best_val:
+            best_val   = vl
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+        if epoch % 10 == 0 or epoch == 1:
+            print(f"  Epoch {epoch:3d}/{cfg['epochs']}  "
+                  f"train={tl:.5f}  val={vl:.5f}  "
+                  f"RUL-RMSE={rul_rmse:.1f} cyc")
+
         if stopper(vl):
             print(f"  Early stop at epoch {epoch}")
             break
 
-    return history
-
-
-def train_phase2(model, train_loader, val_loader, cfg, device, eval_cap=125.0):
-    """
-    Phase 2: joint AE + RUL fine-tuning.
-    Uses F.mse_loss for training (stable gradients) — NOT asymmetric NASA loss.
-    NASA loss is used only for final evaluation.
-    """
-    print("\n── Phase 2: Joint AE + RUL fine-tuning ──")
-    opt     = Adam(model.parameters(), lr=cfg["rul_lr"])
-    sched   = ReduceLROnPlateau(opt, patience=5, factor=0.5)
-    stopper = EarlyStopping(patience=cfg["patience"])
-    history = {"train": [], "val": []}
-
-    for epoch in range(1, cfg["rul_epochs"] + 1):
-        model.train()
-        t_losses = []
-        for X_batch, y_batch in train_loader:
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
-            recon, rul_pred, _ = model(X_batch)
-            # AFTER
-            # TEMPORARY — remove nasa_loss entirely to get stable training
-            loss = (ae_loss(recon, X_batch)
-            + cfg["rul_weight"] * F.mse_loss(rul_pred, y_batch))
-            opt.zero_grad(); loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
-            opt.step()
-            t_losses.append(loss.item())
-
-        model.eval()
-        v_losses, v_rul = [], []
-        with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch = X_batch.to(device)
-                y_batch = y_batch.to(device)
-                recon, rul_pred, _ = model(X_batch)
-                v_losses.append(ae_loss(recon, X_batch).item())
-                v_rul.append(F.mse_loss(rul_pred, y_batch).item())
-
-        tl, vl   = np.mean(t_losses), np.mean(v_losses)
-        rul_rmse = np.sqrt(np.mean(v_rul)) * eval_cap   # denormalize for display
-        history["train"].append(tl)
-        history["val"].append(vl)
-        sched.step(rul_rmse)
-
-        if epoch % 5 == 0 or epoch == 1:
-            print(f"  Epoch {epoch:3d}/{cfg['rul_epochs']}  "
-                  f"train={tl:.5f}  val={vl:.5f}  "
-                  f"RUL-RMSE={rul_rmse:.1f} cyc")
-        if stopper(rul_rmse):
-            print(f"  Early stop at epoch {epoch}")
-            break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"  Restored best weights (val={best_val:.5f}  "
+              f"RMSE={np.sqrt(best_val)*eval_cap:.1f} cyc)")
 
     return history
 
@@ -231,28 +225,48 @@ def train_phase2(model, train_loader, val_loader, cfg, device, eval_cap=125.0):
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate_test(model, X_test, y_test, device, rul_cap=125.0):
-    """RMSE and NASA score on the test set."""
+def evaluate_test(model, X_test, y_test, device, rul_cap=130.0):
+    """
+    RMSE and official NASA scoring function on the test set.
+
+    NASA score = Σ_i f(d_i)
+      d_i = pred_i - true_i
+      f(d) = exp(-d/13) - 1   if d < 0  (late — steep penalty)
+      f(d) = exp( d/10) - 1   if d >= 0 (early — mild penalty)
+    Lower is better.
+    """
     model.eval()
     X_t = torch.from_numpy(X_test).float().to(device)
     _, rul_pred, _ = model(X_t)
-    pred = rul_pred.cpu().numpy() * rul_cap   # back to cycles
-    true = y_test
+    pred = rul_pred.cpu().numpy() * rul_cap   # [0,1] → cycles
+    true = y_test                              # already in cycles
 
     rmse  = float(np.sqrt(np.mean((pred - true) ** 2)))
     d     = pred - true
-    score = float(np.where(d < 0,
-                            np.exp(-d / 13) - 1,
-                            np.exp(d / 10)  - 1).sum())
+    score = float(np.where(
+        d < 0,
+        np.exp(-d / 13) - 1,
+        np.exp( d / 10) - 1,
+    ).sum())
 
-    print(f"\n  Test RMSE  = {rmse:.2f} cycles")
-    print(f"  NASA score = {score:.1f}  (lower = better)")
+    errors  = pred - true
+    abs_err = np.abs(errors)
+
+    print(f"\n  Test RMSE      = {rmse:.2f} cycles")
+    print(f"  NASA score     = {score:.1f}  (lower is better)")
     print(f"  Pred mean={pred.mean():.1f}  std={pred.std():.1f}")
     print(f"  True mean={true.mean():.1f}  std={true.std():.1f}")
-    errors = np.abs(pred - true)
-    worst  = np.argsort(errors)[-5:]
-    print("  Worst 5: " + ", ".join(
-        f"#{i} pred={pred[i]:.0f} true={true[i]:.0f}" for i in worst))
+    print(f"  Mean error     = {errors.mean():.1f} cyc  "
+          f"(positive=early, negative=late)")
+    print(f"  Mean |error|   = {abs_err.mean():.1f} cyc")
+
+    worst = np.argsort(abs_err)[-5:][::-1]
+    print("  Worst 5 engines:")
+    for i in worst:
+        tag = "LATE" if errors[i] < 0 else "early"
+        print(f"    #{i:3d}  pred={pred[i]:6.1f}  true={true[i]:6.1f}  "
+              f"err={errors[i]:+.1f}  ({tag})")
+
     return {"rmse": rmse, "score": score, "pred": pred, "true": true}
 
 
@@ -264,90 +278,90 @@ def train_subset(subset: str, data_dir: str, ckpt_dir: str,
     print(f"Training on {subset}")
     print(f"{'='*55}")
 
-    # Apply subset-specific overrides
     cfg = {**cfg, **SUBSET_CONFIG.get(subset, {})}
-    print(f"  rul_weight={cfg['rul_weight']}  "
-          f"rul_lr={cfg['rul_lr']}  "
-          f"oversample={cfg.get('oversample', 3.0)}  "
-          f"ae_epochs={cfg['ae_epochs']}")
+    print(f"  lr={cfg['lr']}  wd={cfg['weight_decay']}  "
+          f"batch={cfg['batch_size']}  patience={cfg['patience']}  "
+          f"max_epochs={cfg['epochs']}  hidden={cfg['hidden']}  "
+          f"dropout={cfg['dropout']}")
 
     pkl = Path(data_dir) / f"cmapss_{subset.lower()}.pkl"
     if not pkl.exists():
-        print(f"\nERROR: {pkl} not found. Run: python preprocess.py --subset {subset}")
+        print(f"\nERROR: {pkl} not found. "
+              f"Run: python preprocess.py --subset {subset}")
         return
 
     data      = load_data(str(pkl))
     n_sensors = len(data["sensor_cols"])
-    train_cap = data.get("rul_train_cap", cfg["rul_cap"])
-    eval_cap  = data.get("rul_cap", cfg["rul_cap"])
+    eval_cap  = float(data.get("rul_cap", cfg["rul_cap"]))
+    train_cap = eval_cap
 
     print(f"Sensors: {n_sensors}  |  "
           f"Train: {data['X_train'].shape[0]:,} windows  |  "
           f"Val: {data['X_val'].shape[0]:,} windows  |  "
           f"Test: {data['X_test'].shape[0]} engines")
 
-    ae_loader     = make_loader(data["X_ae"], batch_size=cfg["ae_batch"])
-    val_ae_loader = make_loader(data["X_val"], batch_size=256, shuffle=False)
-
-    # Keep this as before — normalized targets
-    y_raw   = data["y_train"] / train_cap      # back to [0, 1]
-    weights = np.where(y_raw >= 1.0, cfg.get("oversample", 3.0), 1.0)
+    # ── Data loaders ──────────────────────────────────────────────────────
+    # Targets normalised to [0, 1] — model output is also clamped to [0, 1]
+    y_raw   = data["y_train"] / train_cap
+    weights = np.where(y_raw >= 0.99, cfg.get("oversample", 2.0), 1.0)
     weights = weights / weights.sum()
-    n   = len(data["X_train"])
-    idx = np.random.default_rng(42).choice(n, size=n, replace=True, p=weights)
+    rng     = np.random.default_rng(SEED)
+    idx     = rng.choice(len(data["X_train"]), size=len(data["X_train"]),
+                          replace=True, p=weights)
     X_bal, y_bal = data["X_train"][idx], y_raw[idx]
-    train_loader = make_loader(X_bal, y_bal, batch_size=cfg["rul_batch"])
+    train_loader = make_loader(X_bal, y_bal, batch_size=cfg["batch_size"])
 
-    val_rul_loader = make_loader(
-    data["X_val"],
-    data["y_val"] / train_cap,   # normalized
-    batch_size=256, shuffle=False
+    val_loader = make_loader(
+        data["X_val"],
+        data["y_val"] / train_cap,
+        batch_size=256, shuffle=False,
     )
 
+    # ── Model ─────────────────────────────────────────────────────────────
+    set_seed(SEED)
     model = FaultSenseModel(
         n_sensors=n_sensors,
         hidden=cfg["hidden"],
-        latent=cfg["latent"],
-        seq_len=cfg["seq_len"],
         dropout=cfg["dropout"],
         rul_cap=cfg["rul_cap"],
     ).to(device)
     print(f"Parameters: {count_params(model):,}")
 
-    # ── MLflow run ────────────────────────────────────────────────────────
+    # ── MLflow ────────────────────────────────────────────────────────────
     mlflow.set_experiment("FaultSense")
     with mlflow.start_run(run_name=subset):
 
         mlflow.log_params({
-            "subset":      subset,
-            "hidden":      cfg["hidden"],
-            "latent":      cfg["latent"],
-            "seq_len":     cfg["seq_len"],
-            "dropout":     cfg["dropout"],
-            "rul_weight":  cfg["rul_weight"],
-            "rul_lr":      cfg["rul_lr"],
-            "ae_epochs":   cfg["ae_epochs"],
-            "rul_epochs":  cfg["rul_epochs"],
-            "oversample":  cfg.get("oversample", 3.0),
-            "train_cap":   train_cap,
-            "k_sigma":     cfg["k_sigma"],
-            "n_sensors":   n_sensors,
+            "subset":         subset,
+            "hidden":         cfg["hidden"],
+            "dropout":        cfg["dropout"],
+            "lr":             cfg["lr"],
+            "weight_decay":   cfg["weight_decay"],
+            "batch_size":     cfg["batch_size"],
+            "epochs":         cfg["epochs"],
+            "patience":       cfg["patience"],
+            "sched_factor":   cfg["sched_factor"],
+            "sched_patience": cfg["sched_patience"],
+            "oversample":     cfg.get("oversample", 2.0),
+            "rul_cap":        train_cap,
+            "n_sensors":      n_sensors,
+            "seed":           SEED,
         })
 
-        t0 = time.time()
-        h1 = train_phase1(model, ae_loader, val_ae_loader, cfg, device)
-        h2 = train_phase2(model, train_loader, val_rul_loader, cfg, device,
-                          eval_cap=eval_cap)
+        t0   = time.time()
+        hist = train_model(model, train_loader, val_loader, cfg, device,
+                           eval_cap=eval_cap)
         train_time = time.time() - t0
         print(f"\nTraining time: {train_time/60:.1f} min")
 
-        # Log loss curves
-        for epoch, (tl, vl) in enumerate(zip(h1["train"], h1["val"]), 1):
-            mlflow.log_metrics({"ae_train_loss": tl, "ae_val_loss": vl}, step=epoch)
-        for epoch, (tl, vl) in enumerate(zip(h2["train"], h2["val"]), 1):
-            mlflow.log_metrics({"rul_train_loss": tl, "rul_val_loss": vl}, step=epoch)
+        # Log curves
+        for epoch, (tl, vl) in enumerate(zip(hist["train"], hist["val"]), 1):
+            mlflow.log_metrics({"rul_train_loss": tl, "rul_val_loss": vl},
+                               step=epoch)
 
-        model.calibrate_threshold(data["X_ae"], k_sigma=cfg["k_sigma"], device=device)
+        # Threshold stub (no AE)
+        model.calibrate_threshold(data["X_ae"], k_sigma=cfg["k_sigma"],
+                                   device=device)
 
         test_results = evaluate_test(model, data["X_test"], data["y_test"],
                                       device, eval_cap)
@@ -355,22 +369,22 @@ def train_subset(subset: str, data_dir: str, ckpt_dir: str,
         mlflow.log_metrics({
             "test_rmse":       round(test_results["rmse"], 2),
             "test_nasa_score": round(test_results["score"], 1),
-            "threshold":       round(float(model.threshold), 5),
             "train_time_min":  round(train_time / 60, 2),
         })
 
         ckpt_path = Path(ckpt_dir) / f"faultsense_{subset.lower()}.pt"
         Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
         torch.save({
-            "subset":       subset,
-            "model_state":  model.state_dict(),
-            "config":       cfg,
-            "threshold":    model.threshold,
-            "sensor_cols":  data["sensor_cols"],
-            "n_conditions": data["n_conditions"],
-            "history_ae":   h1,
-            "history_rul":  h2,
-            "test_results": test_results,
+            "subset":        subset,
+            "model_state":   model.state_dict(),
+            "config":        cfg,
+            "threshold":     model.threshold,
+            "sensor_cols":   data["sensor_cols"],
+            "n_conditions":  data["n_conditions"],
+            "norm_stats":    data.get("norm_stats"),
+            "history_ae":    {"train": [], "val": []},   # empty — no AE phase
+            "history_rul":   hist,
+            "test_results":  test_results,
             "mlflow_run_id": mlflow.active_run().info.run_id,
         }, str(ckpt_path))
         print(f"\nCheckpoint saved → {ckpt_path}")
@@ -384,14 +398,12 @@ def load_checkpoint(path: str, device: str = "cpu"):
     cfg   = ckpt["config"]
     model = FaultSenseModel(
         n_sensors=len(ckpt["sensor_cols"]),
-        hidden=cfg["hidden"],
-        latent=cfg["latent"],
-        seq_len=cfg["seq_len"],
-        dropout=cfg["dropout"],
-        rul_cap=cfg["rul_cap"],
+        hidden=cfg.get("hidden", 32),
+        dropout=cfg.get("dropout", 0.5),
+        rul_cap=cfg.get("rul_cap", 130.0),
     )
     model.load_state_dict(ckpt["model_state"])
-    model.threshold   = ckpt["threshold"]
+    model.threshold   = ckpt.get("threshold", 0.0)
     model.sensor_cols = ckpt["sensor_cols"]
     model.eval()
     return model, ckpt
@@ -403,7 +415,6 @@ def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # MLflow tracking URI
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
     try:
         mlflow.set_tracking_uri(tracking_uri)
@@ -426,7 +437,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--subset", nargs="+", choices=ALL_SUBSETS)
-    parser.add_argument("--all",   action="store_true")
-    parser.add_argument("--data",  default=None)
-    parser.add_argument("--out",   default=None)
+    parser.add_argument("--all",    action="store_true")
+    parser.add_argument("--data",   default=None)
+    parser.add_argument("--out",    default=None)
     main(parser.parse_args())
