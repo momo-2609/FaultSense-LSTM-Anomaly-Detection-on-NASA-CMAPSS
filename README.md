@@ -1,5 +1,7 @@
 # ⚡ FaultSense
 
+[![CI](https://github.com/momo-2609/FaultSense-LSTM-Anomaly-Detection-on-NASA-CMAPSS/actions/workflows/ci.yml/badge.svg)](https://github.com/momo-2609/FaultSense-LSTM-Anomaly-Detection-on-NASA-CMAPSS/actions/workflows/ci.yml)
+
 **LSTM Autoencoder for anomaly detection and Remaining Useful Life (RUL) prediction on NASA CMAPSS turbofan engine data.**
 
 FaultSense trains an end-to-end deep learning pipeline that reconstructs sensor windows to detect degradation, predicts RUL in cycles, and surfaces results through an interactive fleet health dashboard and a production-ready REST API.
