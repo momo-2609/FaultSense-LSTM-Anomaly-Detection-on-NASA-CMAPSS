@@ -1,13 +1,28 @@
+name: CI
+
 on:
-  push:              # whenever you push to main...
-    branches: [main]
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
 
 jobs:
   test:
-    runs-on: ubuntu-latest   # ...spin up a fresh Linux machine
+    runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4         # download your code
-      - uses: actions/setup-python@v5     # install Python 3.11
-      - run: pip install -e ".[dev]"      # install your dependencies
-      - run: pytest tests/ -v             # run your tests
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Upgrade pip and setuptools
+        run: pip install --upgrade pip setuptools wheel
+
+      - name: Install dependencies
+        run: pip install pytest pytest-cov numpy
+
+      - name: Run tests
+        run: pytest tests/ -v --cov=metrics --cov-report=term-missing
