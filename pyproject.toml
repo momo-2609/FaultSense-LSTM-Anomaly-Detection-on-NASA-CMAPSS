@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "faultsense"
@@ -35,7 +35,7 @@ api = [
     "pydantic>=2.7",
 ]
 dashboard = [
-    "streamlit>=1.35",
+    "dash>=2.17",
     "plotly>=5.22",
 ]
 tracking = [
@@ -50,8 +50,8 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/momo-2609/faultsense"
-Repository = "https://github.com/momo-2609/faultsense"
+Homepage = "https://github.com/momo-2609/FaultSense-LSTM-Anomaly-Detection-on-NASA-CMAPSS"
+Repository = "https://github.com/momo-2609/FaultSense-LSTM-Anomaly-Detection-on-NASA-CMAPSS"
 
 [tool.setuptools.packages.find]
 where = ["."]
