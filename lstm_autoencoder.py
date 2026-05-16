@@ -1,246 +1,134 @@
 """
 models/lstm_autoencoder.py
 --------------------------
-Bidirectional LSTM Autoencoder for anomaly detection on CMAPSS.
+Simple LSTM for RUL estimation — paper Algorithm 5.
 
-Architecture
-  Encoder : BiLSTM(128) → Dropout(0.2) → LSTM(64) → Dense(32, tanh)
-  Decoder : RepeatVector(30) → LSTM(64) → LSTM(128) → TimeDistributed Dense(14)
+Architecture (exact match to paper):
+  LSTM(n_sensors → hidden=32, batch_first=True)
+  → take last hidden state hT
+  → Dropout(0.5)
+  → Linear(32 → 8) → ReLU
+  → Linear(8  → 8) → ReLU
+  → Linear(8  → 1)
+  → clamp(0, 1)   [targets are normalised to [0,1] during training]
 
-Anomaly score = per-window MSE reconstruction error.
-Threshold = μ + 3σ over healthy training windows.
+At inference: output × rul_cap gives predicted RUL in cycles.
+
+Note: the old BiLSTM autoencoder (LSTMEncoder, LSTMDecoder, LSTMAutoencoder,
+RULHead) is replaced by this single class. FaultSenseModel is kept as the
+external interface so train.py and app.py require no changes.
+The calibrate_threshold / anomaly-detection path is retained as a no-op
+stub so existing checkpoint-loading code does not break.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Optional, Tuple
 
 
-class LSTMEncoder(nn.Module):
-    """Bidirectional LSTM encoder → fixed-size latent vector with attention."""
+# ── Core model ────────────────────────────────────────────────────────────────
 
-    def __init__(self, n_sensors: int, hidden: int = 128, latent: int = 32,
-                 dropout: float = 0.2):
+class FaultSenseModel(nn.Module):
+    """
+    Simple LSTM RUL estimator matching paper Algorithm 5.
+
+    forward(x) returns (None, rul_pred, hT) to preserve the three-element
+    tuple that train.py and app.py expect from the old FaultSenseModel.
+    The first element (reconstruction) is None — train.py must NOT compute
+    ae_loss when using this model (see train.py Phase 2 loss comment).
+    """
+
+    def __init__(self, n_sensors: int = 14, hidden: int = 32,
+                 dropout: float = 0.5, rul_cap: float = 130.0,
+                 # Legacy kwargs accepted but ignored — keeps train.py compat
+                 latent: int = 32, seq_len: int = 30, **kwargs):
         super().__init__()
-        self.bilstm = nn.LSTM(
+        self.rul_cap   = rul_cap
+        self.threshold = None   # anomaly threshold stub
+
+        self.lstm = nn.LSTM(
             input_size=n_sensors,
             hidden_size=hidden,
             num_layers=1,
             batch_first=True,
-            bidirectional=True,
         )
         self.dropout = nn.Dropout(dropout)
-        self.lstm2 = nn.LSTM(
-            input_size=hidden * 2,
-            hidden_size=hidden,
-            num_layers=1,
-            batch_first=True,
-        )
-        # Temporal attention: learn a scalar weight per timestep.
-        # Later cycles (closer to prediction point) get higher weight
-        # for degrading engines, giving better temporal localisation.
-        self.attention    = nn.Linear(hidden, 1)
-        self.fc_bottleneck = nn.Linear(hidden, latent)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x : (B, T, n_sensors) → (B, latent)"""
-        out, _ = self.bilstm(x)               # (B, T, 2*hidden)
-        out    = self.dropout(out)
-        out, _ = self.lstm2(out)              # (B, T, hidden)
-        # Weighted sum over timesteps
-        attn_w  = torch.softmax(self.attention(out), dim=1)  # (B, T, 1)
-        context = (attn_w * out).sum(dim=1)                  # (B, hidden)
-        z = torch.tanh(self.fc_bottleneck(context))          # (B, latent)
-        return z
-
-
-class LSTMDecoder(nn.Module):
-    """LSTM decoder: latent vector → reconstructed sequence."""
-
-    def __init__(self, n_sensors: int, hidden: int = 128, latent: int = 32,
-                 seq_len: int = 30):
-        super().__init__()
-        self.seq_len = seq_len
-        self.lstm1 = nn.LSTM(
-            input_size=latent,
-            hidden_size=hidden // 2,
-            num_layers=1,
-            batch_first=True,
-        )
-        self.lstm2 = nn.LSTM(
-            input_size=hidden // 2,
-            hidden_size=hidden,
-            num_layers=1,
-            batch_first=True,
-        )
-        self.output_proj = nn.Linear(hidden, n_sensors)
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        z : (B, latent)
-        returns: (B, T, n_sensors)
-        """
-        # Repeat latent vector across timesteps
-        z_rep = z.unsqueeze(1).expand(-1, self.seq_len, -1)   # (B, T, latent)
-        out, _ = self.lstm1(z_rep)        # (B, T, hidden//2)
-        out, _ = self.lstm2(out)          # (B, T, hidden)
-        recon  = self.output_proj(out)    # (B, T, n_sensors)
-        return recon
-
-
-class LSTMAutoencoder(nn.Module):
-    """
-    Full autoencoder: encode → bottleneck → decode.
-    Trained to reconstruct healthy sensor windows.
-    Anomaly score = MSE(input, reconstruction).
-    """
-
-    def __init__(self, n_sensors: int = 14, hidden: int = 128,
-                 latent: int = 32, seq_len: int = 30, dropout: float = 0.2):
-        super().__init__()
-        self.encoder = LSTMEncoder(n_sensors, hidden, latent, dropout)
-        self.decoder = LSTMDecoder(n_sensors, hidden, latent, seq_len)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        x : (B, T, n_sensors)
-        returns: (reconstruction, latent_z)
-        """
-        z     = self.encoder(x)
-        recon = self.decoder(z)
-        return recon, z
-
-    def reconstruction_error(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Per-sample MSE reconstruction error.
-        x : (B, T, n_sensors)
-        returns: (B,)
-        """
-        recon, _ = self.forward(x)
-        return F.mse_loss(recon, x, reduction="none").mean(dim=(1, 2))
-
-    def per_sensor_error(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Per-sensor reconstruction error for explainability.
-        x : (B, T, n_sensors)
-        returns: (B, n_sensors)
-        """
-        recon, _ = self.forward(x)
-        return F.mse_loss(recon, x, reduction="none").mean(dim=1)   # avg over T
-
-
-class RULHead(nn.Module):
-    def __init__(self, latent: int = 32, rul_cap: float = 125.0):
-        super().__init__()
-        self.rul_cap = rul_cap
-        self.mlp = nn.Sequential(
-            nn.Linear(latent, 64),
+        self.head = nn.Sequential(
+            nn.Linear(hidden, 8),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 32),
+            nn.Linear(8, 8),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Linear(16, 1),
+            nn.Linear(8, 1),
         )
-
-    def forward(self, z):
-        rul = self.mlp(z).squeeze(-1)
-        return torch.clamp(rul, 0.0, 1.0)
-
-
-class FaultSenseModel(nn.Module):
-    """
-    Combined model: autoencoder anomaly detection + RUL regression.
-    Single forward pass returns both outputs.
-    """
-
-    def __init__(self, n_sensors: int = 14, hidden: int = 128,
-                 latent: int = 32, seq_len: int = 30,
-                 dropout: float = 0.2, rul_cap: float = 125.0):
-        super().__init__()
-        self.autoencoder = LSTMAutoencoder(n_sensors, hidden, latent,
-                                           seq_len, dropout)
-        self.rul_head    = RULHead(latent, rul_cap)
-        self.threshold   = None   # set after calibration
 
     def forward(self, x: torch.Tensor):
-        recon, z  = self.autoencoder(x)
-        rul_pred  = self.rul_head(z)
-        return recon, rul_pred, z
+        """
+        x   : (B, T, n_sensors)
+        returns (None, rul_pred, hT)
+          None     — no reconstruction (no AE)
+          rul_pred — (B,) predicted RUL normalised to [0, 1]
+          hT       — (B, hidden) last hidden state (latent representation)
+        """
+        out, _  = self.lstm(x)            # (B, T, hidden)
+        hT      = out[:, -1, :]           # last timestep: (B, hidden)
+        hT_drop = self.dropout(hT)
+        rul     = self.head(hT_drop).squeeze(-1)   # (B,)
+        rul     = torch.clamp(rul, 0.0, 1.0)
+        return None, rul, hT
+
+    def predict(self, x: np.ndarray, device: str = "cpu") -> dict:
+        """
+        Inference on a single window or batch.
+        x : (T, n_sensors) or (B, T, n_sensors)
+        Returns dict with 'rul' in cycles and stub anomaly fields.
+        """
+        self.eval()
+        single = x.ndim == 2
+        if single:
+            x = x[np.newaxis]
+
+        with torch.no_grad():
+            t = torch.from_numpy(x.astype(np.float32)).to(device)
+            _, rul_pred, _ = self.forward(t)
+            rul_cycles = rul_pred.cpu().numpy() * self.rul_cap
+
+        return {
+            "rul":            rul_cycles[0] if single else rul_cycles,
+            "anomaly_score":  None,
+            "per_sensor_mse": None,
+            "is_anomaly":     None,
+        }
 
     @torch.no_grad()
     def calibrate_threshold(self, X_healthy: np.ndarray,
                              k_sigma: float = 3.0,
                              device: str = "cpu") -> float:
         """
-        Set anomaly threshold = μ + k*σ of healthy reconstruction errors.
-        Call this after training, before deployment.
+        Stub — no autoencoder so no reconstruction threshold.
+        Sets self.threshold = 0.0 to satisfy train.py's calibrate call.
         """
-        self.eval()
-        errors = []
-        loader = torch.utils.data.DataLoader(
-            torch.from_numpy(X_healthy).float(),
-            batch_size=256, shuffle=False
-        )
-        for batch in loader:
-            batch = batch.to(device)
-            err   = self.autoencoder.reconstruction_error(batch)
-            errors.append(err.cpu().numpy())
-
-        errors = np.concatenate(errors)
-        mu, sig = errors.mean(), errors.std()
-        self.threshold = float(mu + k_sigma * sig)
-        print(f"Threshold calibrated: μ={mu:.4f}  σ={sig:.4f}  "
-              f"threshold={self.threshold:.4f}")
+        self.threshold = 0.0
+        print("Threshold calibration: N/A (simple LSTM has no AE). "
+              "Anomaly detection disabled.")
         return self.threshold
 
-    @torch.no_grad()
-    def predict(self, x: np.ndarray, device: str = "cpu"):
-        """
-        Full inference on a numpy window.
-        x : (T, n_sensors) or (B, T, n_sensors)
-        Returns dict with anomaly score, rul, per-sensor errors, flag.
-        """
-        self.eval()
-        single = x.ndim == 2
-        if single:
-            x = x[np.newaxis]   # add batch dim
 
-        t = torch.from_numpy(x.astype(np.float32)).to(device)
-        recon, rul_pred, _ = self.forward(t)
-        raw_err  = F.mse_loss(recon, t, reduction="none")
-        score    = raw_err.mean(dim=(1, 2)).cpu().numpy()
-        per_sens = raw_err.mean(dim=1).cpu().numpy()   # (B, n_sensors)
-        rul      = rul_pred.cpu().numpy()
-
-        # Denormalise RUL from [0,1] training space → cycles
-        rul_cycles = rul
-        result = {
-            "anomaly_score":  score[0]      if single else score,
-            "rul":            rul_cycles[0] if single else rul_cycles,
-            "per_sensor_mse": per_sens[0]   if single else per_sens,
-            "is_anomaly": (score[0] > self.threshold) if (
-                single and self.threshold is not None) else None,
-        }
-        return result
-
+# ── Parameter count helper ────────────────────────────────────────────────────
 
 def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+# ── Smoke test ────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    model = FaultSenseModel()
+    model = FaultSenseModel(n_sensors=14, hidden=32, dropout=0.5, rul_cap=130.0)
     print(f"Total trainable parameters: {count_params(model):,}")
 
-    # Smoke test
     dummy = torch.randn(4, 30, 14)
-    recon, rul, z = model(dummy)
-    print(f"Input:         {dummy.shape}")
-    print(f"Reconstruction:{recon.shape}")
-    print(f"RUL prediction:{rul.shape}")
-    print(f"Latent z:      {z.shape}")
+    _, rul, hT = model(dummy)
+    print(f"Input shape   : {dummy.shape}")
+    print(f"RUL pred shape: {rul.shape}   (normalised, expect values in [0,1])")
+    print(f"Latent hT     : {hT.shape}")
+    print(f"Sample preds  : {rul.detach().numpy().round(3)}")
