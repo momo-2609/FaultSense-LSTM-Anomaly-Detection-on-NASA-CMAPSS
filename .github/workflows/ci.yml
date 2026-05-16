@@ -1,1 +1,13 @@
+on:
+  push:              # whenever you push to main...
+    branches: [main]
 
+jobs:
+  test:
+    runs-on: ubuntu-latest   # ...spin up a fresh Linux machine
+
+    steps:
+      - uses: actions/checkout@v4         # download your code
+      - uses: actions/setup-python@v5     # install Python 3.11
+      - run: pip install -e ".[dev]"      # install your dependencies
+      - run: pytest tests/ -v             # run your tests
