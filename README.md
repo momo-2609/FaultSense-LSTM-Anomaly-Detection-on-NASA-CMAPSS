@@ -25,6 +25,9 @@ FaultSense trains an end-to-end deep learning pipeline that reconstructs sensor 
 
 The LSTM beats both Ridge baselines on every metric across both subsets. NASA Score uses the official asymmetric PHM scoring function — late predictions (predicting more life than remains) are penalised harder than early ones, reflecting real-world safety asymmetry.
 
+<img width="950" height="476" alt="Capture d’écran 2026-05-16 155037" src="https://github.com/user-attachments/assets/2a38bd74-e179-4def-b5b7-e502eea7b0a9" />
+<img width="752" height="422" alt="Capture d’écran 2026-05-16 155121" src="https://github.com/user-attachments/assets/e8593555-cc17-4ae3-94d9-b780c273a2ff" />
+
 ---
 
 ## Architecture
